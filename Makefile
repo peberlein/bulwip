@@ -1,7 +1,7 @@
 CFLAGS+=-O2 -g
 
 bulwip: bulwip.o cpu.o sdl.o
-bulwip:LDLIBS += $(shell pkg-config --libs sdl2) -lreadline
+bulwip:LDLIBS += $(shell pkg-config --libs sdl2)
 
 sdl.o: sdl.c player.h
 sdl.o:CFLAGS += $(shell pkg-config --cflags sdl2)

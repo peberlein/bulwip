@@ -1,3 +1,26 @@
+/*
+ *  cpu.c - TMS 9900 CPU emulation
+ *
+ * Copyright (c) 2023 Pete Eberlein
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
 
 #ifdef _MSC_VER
 #define _CRT_SECURE_NO_WARNINGS
@@ -441,8 +464,22 @@ static void mem_w_TdB(u16 op, struct val_addr va)
 
 
 /****************************************
- * Interrupts                           *
+ * Reset and Interrupts                 *
  ****************************************/
+
+void cpu_reset(void)
+{
+	unsigned saved_cyc = cyc;
+
+	// on reset
+	wp = mem_r(0);
+	pc = mem_r(2);
+	//pc = mem_r(0x600e);
+	st = 0xc3f0; //0x0060;
+
+	cyc = saved_cyc;
+
+}
 
 void interrupt(int level)
 {
@@ -839,7 +876,7 @@ XOP:
 	pc = mem_r(0x0042 + (reg << 2));
 	wp = ts;
 	st |= ST_X;
-	printf("XOP %04x %d  PC=%04x WP=%04x\n", td.val, reg, pc, wp);
+	//printf("XOP %04x %d  PC=%04x WP=%04x\n", td.val, reg, pc, wp);
 
 	goto decode_op_now; // next instruction cannot be interrupted
 BLWP:
@@ -1074,19 +1111,4 @@ done:
 	return ret;
 }
 
-
-
-void cpu_reset(void)
-{
-	unsigned saved_cyc = cyc;
-
-	// on reset
-	wp = mem_r(0);
-	pc = mem_r(2);
-	//pc = mem_r(0x600e);
-	st = 0xc3f0; //0x0060;
-
-	cyc = saved_cyc;
-
-}
 

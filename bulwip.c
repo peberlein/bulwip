@@ -1,3 +1,26 @@
+/*
+ *  bulwip.c - TI 99/4A emulator
+ *
+ * Copyright (c) 2023 Pete Eberlein
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
 
 #ifdef _MSC_VER
 #define _CRT_SECURE_NO_WARNINGS
@@ -23,6 +46,7 @@ static FILE *disasmf = NULL;
 int debug_log(const char *fmt, ...)
 {
 	va_list ap;
+	if (!log) return 0;
 	va_start(ap, fmt);
 	int ret = vfprintf(log, fmt, ap);
 	va_end(ap);
@@ -32,6 +56,7 @@ int debug_log(const char *fmt, ...)
 int print_asm(const char *fmt, ...)
 {
 	va_list ap;
+	if (!disasmf) return 0;
 	va_start(ap, fmt);
 	int ret = vfprintf(disasmf, fmt, ap);
 	va_end(ap);
@@ -721,32 +746,6 @@ static void load_grom(char *filename, u16 addr)
 
 
 
-#if 0
-#include <readline/readline.h>
-#include <readline/history.h>
-
-static void prompt(void)
-{
-	static int interactive = 0;
-	if (pc == 0x900 || pc == 0x28)
-		interactive = 1;
-	if (!interactive)
-		return;
-	do {
-		char *line = readline("> ");
-		if (!line)
-			exit(0);
-		if (strcmp(line,"r") == 0) {
-			print_regs();
-		} else if (strcmp(line,"c") == 0) {
-			interactive = 0;
-			break;
-		} else {
-			break;
-		}
-	} while (1);
-}
-#endif
 
 #ifndef USE_SDL
 static void vdp_init(void)
@@ -883,8 +882,6 @@ void reset(void)
 	grom_last = 0xaf;
 
 	// TODO reload cartridge images too
-
-
 }
 
 
@@ -903,11 +900,11 @@ void reset(void)
 
 int main(int argc, char *argv[])
 {
-	log = fopen("/tmp/bulwip.log","w");
+	//log = fopen("/tmp/bulwip.log","w");
 	//log = fopen("/dev/null","w");
 	//log = fopen("cpu.log","w");
 	//if (!log) log = stderr;
-	if (!log) log = fopen("NUL","w");
+	//if (!log) log = fopen("NUL","w");
 
 
 	mem_init();
@@ -927,38 +924,28 @@ int main(int argc, char *argv[])
 	load_rom("994arom.bin", &rom, &rom_size);
 	load_grom("994agrom.bin", 0);
 
+	// Give GROM char patterns for debugger
 	vdp_text_pat(grom + 0x06B4 - 32*7);
 
 	if (argc > 1) {
 		load_rom(argv[1], &cart_ram, &cart_size);
 	} else {
 		//load_rom("../phantis/phantisc.bin", &cart_ram, &cart_size);
-		load_rom("cputestc.bin", &cart_ram, &cart_size);
+		//load_rom("cputestc.bin", &cart_ram, &cart_size);
 		//load_rom("../wordit/wordit8.bin", &cart_ram, &cart_size);
 		//load_rom("cputestc.bin", &cart_ram, &cart_size);
 	}
 
-	set_mapping(6, map_r, cart_rom_w, cart_ram);
-	set_mapping(7, map_r, zero_w, cart_ram + 2048/*words*/);
-
-	{
+	if (cart_ram) {
 		unsigned int banks = (cart_size + 0x1fff) >> 13;
+
+		set_mapping(6, map_r, cart_rom_w, cart_ram);
+		set_mapping(7, map_r, zero_w, cart_ram + 2048/*words*/);
+
 		cart_bank_mask = banks ? (1 << (32-__builtin_clz(banks))) - 1 : 0;
 		printf("cart_bank_mask = 0x%x  (size=%d banks=%d) page_size=%d\n", 
 			cart_bank_mask, cart_size, banks, 256/*1<<MAP_SHIFT*/);
 	}
-
-
-	if (0) { // disassemble rom
-		int i;
-		for (i = 0; i < 8192; i+=2) {
-			disasm(i);
-		}
-		return 0;
-	}
-
-
-
 
 	vdp_init();
 
@@ -985,16 +972,6 @@ int main(int argc, char *argv[])
 		if (debug_en) {
 			unsigned char reg[53*30] = { [0 ... 53*30-1]=32};
 			debug_refresh:
-#if 0
-			sprintf(reg+53*1, "  PC=%04X WP=%04X ST=%04X   R0 = %04X   R8  = %04X   ", pc, wp, st, safe_r(wp), safe_r(wp+16));
-			sprintf(reg+53*2, "                            R1 = %04X   R9  = %04X   ", safe_r(wp+2), safe_r(wp+18));
-			sprintf(reg+53*3, "                            R2 = %04X   R10 = %04X   ", safe_r(wp+4), safe_r(wp+20));
-			sprintf(reg+53*4, "                            R3 = %04X   R11 = %04X   ", safe_r(wp+6), safe_r(wp+22));
-			sprintf(reg+53*5, "                            R4 = %04X   R12 = %04X   ", safe_r(wp+8), safe_r(wp+24));
-			sprintf(reg+53*6, "                            R5 = %04X   R13 = %04X   ", safe_r(wp+10), safe_r(wp+26));
-			sprintf(reg+53*7, "                            R6 = %04X   R14 = %04X   ", safe_r(wp+12), safe_r(wp+28));
-			sprintf(reg+53*8, "                            R7 = %04X   R15 = %04X   ", safe_r(wp+14), safe_r(wp+30));
-#else
 			sprintf((char*)reg, 
 			      "\n  VDP0: %02X  VDP: %04X      R0: %04X   R8:  %04X\n"
 				"  VDP1: %02X  VDPST: %02X      R1: %04X   R9:  %04X\n"
@@ -1012,7 +989,6 @@ int main(int argc, char *argv[])
 				vdp.reg[5], st, safe_r(wp+10), safe_r(wp+26),
 				vdp.reg[6], safe_r(wp+12), safe_r(wp+28),
 				vdp.reg[7], safe_r(wp+14), safe_r(wp+30));
-#endif
 			vdp_text_window(reg, 53, 30, 0, 240, -1);
 
 			extern void mute(int en);
@@ -1035,27 +1011,5 @@ int main(int argc, char *argv[])
 	done:
 	fprintf(log, "%d\n", cyc + total_cycles);
 	vdp_done();
-	//print_regs();
-
-	//print_name_table(vdp.reg, vdp.ram);
-
-#if 0
-	{
-		FILE *f = fopen("cpudump.bin", "wb");
-		int i;
-		for (i = 0; i < ARRAY_SIZE(ram); i++) {
-			putc(ram[i] >> 8, f);
-			putc(ram[i] & 0xff, f);
-		}
-		fclose(f);
-	}
-#endif
-#if 0
-	{
-		FILE *f = fopen("vdpdump.bin", "wb");
-		fwrite(vdp.ram, VDP_RAM_SIZE, 1, f);
-		fclose(f);
-	}
-#endif
 	fclose(log);
 }
