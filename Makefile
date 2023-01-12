@@ -3,9 +3,18 @@ CFLAGS+=-O2 -g
 bulwip: bulwip.o cpu.o sdl.o
 bulwip:LDLIBS += $(shell pkg-config --libs sdl2)
 
+bench: bulwip.c cpu.c sdl.c player.h
+	gcc -O3 -DTEST bulwip.c cpu.c -o bench 
+
 sdl.o: sdl.c player.h
 sdl.o:CFLAGS += $(shell pkg-config --cflags sdl2)
 
+
+994arom.h: 994arom.bin
+	xxd -i -n rom994a $^ $@
+
+994agrom.h: 994agrom.bin
+	xxd -i -n grom994a $^ $@
 
 99test2.bin_0000: 99test2.txt
 	../xdt99-master/xas99.py -R -b 99test2.txt -o 99test2.bin

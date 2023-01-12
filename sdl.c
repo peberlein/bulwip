@@ -218,7 +218,7 @@ void vdp_init(void)
 	}
 	first_tick = SDL_GetTicks();
 
-	vdp_set_fps(NTSC_FPS);
+	//vdp_set_fps(NTSC_FPS);
 }
 
 
@@ -384,7 +384,7 @@ void vdp_line(unsigned int line,
 		// no sprites in text mode
 		if (!(reg[1] & 0x10)) {
 			unsigned char sp_size = (reg[1] & 2) ? 16 : 8;
-			unsigned char sp_mag = reg[1] & 1; // 0=normal 1=2x magnification
+			unsigned char sp_mag = sp_size << (reg[1] & 1); // magnified sprite size
 			unsigned char *sl = ram + (reg[5] & 0x7f) * 0x80; // sprite list
 			unsigned char *sp = ram + (reg[6] & 0x7) * 0x800; // sprite pattern table
 			unsigned char coinc[256] = {};
@@ -408,7 +408,7 @@ void vdp_line(unsigned int line,
 					break;
 				if (y > 0xD0)
 					dy += 256; // wraps around top of screen
-				if (y+1+sp_size <= dy || y+1 > dy)
+				if (y+1+sp_mag <= dy || y+1 > dy)
 					continue; // not visible
 				if (sp_size == 16)
 					s &= 0xfc; // mask sprite index
@@ -427,37 +427,37 @@ void vdp_line(unsigned int line,
 				sprites[sprite_count].f = f;
 				sprite_count++;
 			}
+			// draw in reverse order so that lower sprite index are higher priority
 			while (sprite_count > 0) {
 				sprite_count--;
 				unsigned char *p = sprites[sprite_count].p; // pattern pointer
 				int x = sprites[sprite_count].x;
-				unsigned char f = sprites[sprite_count].f;
+				unsigned char f = sprites[sprite_count].f; // flags and color
 				unsigned int c = palette[f & 0xf];
 				unsigned int mask = (p[0] << 8) | p[16]; // bit mask of solid pixels
-				int count = sp_size * (sp_mag+1); // number of pixels to draw
+				int count = sp_mag; // number of pixels to draw
+				int inc_mask = (reg[1] & 1) ? 1 : 0xff;
 
 
 				//printf("%d %d %d %04x\n", sprite_count, x, f, mask);
 				if (f & EARLY_CLOCK_BIT) {
 					x -= 32;
 					while (count > 0 && x < 0) {
-						if (sp_mag == 0 || (count & 1))
+						if (count & inc_mask)
 							mask <<= 1;
 						++x;
 						count--;
 					}
 				}
-				f &= 0xf; // mask color index
 
 				while (count > 0) {
 					if (mask & 0x8000) {
 						if (f != 0)  // don't draw transparent color
 							pixels[x] = c;
-						if (coinc[x])
-							reg[8] |= SPRITE_COINC;
-						coinc[x] = 1;
+						reg[8] |= coinc[x];
+						coinc[x] = SPRITE_COINC;
 					}
-					if (sp_mag == 0 || (count & 1))
+					if (count & inc_mask)
 						mask <<= 1;
 					if (++x >= 256)
 						break;
@@ -480,8 +480,8 @@ void vdp_text_pat(unsigned char *pat)
 
 void vdp_text_window(const unsigned char *line, int w, int h, int x, int y, int highlight_line)
 {
-	char fg_color = 15;
-	char bg_color = 4;
+	char fg_color = 1; //15;
+	char bg_color = 14; //4;
 	uint32_t bg = palette[highlight_line == 0 ? fg_color : bg_color];
 	uint32_t fg = palette[highlight_line == 0 ? bg_color : fg_color];
 	uint32_t *pixels;
@@ -494,6 +494,10 @@ void vdp_text_window(const unsigned char *line, int w, int h, int x, int y, int 
 	pixels += x + y * (pitch/4);
 	for (unsigned int j = 0; j < h*8; j++) {
 		if ((j&7) == 7) {
+			if (j/8 == highlight_line-1) {
+				bg = palette[fg_color];  // inverted
+				fg = palette[bg_color];
+			}
 			for (unsigned int i = 0; i < w*6; i++)
 				*pixels++ = bg;
 			//line += w;
@@ -501,10 +505,7 @@ void vdp_text_window(const unsigned char *line, int w, int h, int x, int y, int 
 			text_pat -= 7;
 			pixels += (pitch/4) - (w*6);
 
-			if (j/8 == highlight_line-1) {
-				bg = palette[fg_color];  // inverted
-				fg = palette[bg_color];
-			} else if (j/8 == highlight_line) {
+			if (j/8 == highlight_line) {
 				bg = palette[bg_color];  // normal
 				fg = palette[fg_color];
 			}
@@ -524,6 +525,13 @@ void vdp_text_window(const unsigned char *line, int w, int h, int x, int y, int 
 			for (unsigned char m = 0x80; m != 2; m >>= 1)
 				*pixels++ = ch & m ? fg : bg;
 		}
+		if (line[-1] == 0)
+			line--;
+		else if (line[-1] == '\n' && line[0] == '\r')
+			line++;
+		else if (line[-1] == '\r' && line[0] == '\n')
+			line++;
+
 		pixels += (pitch/4) - (w*6);
 		text_pat++;
 	}
