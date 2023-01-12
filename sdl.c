@@ -218,7 +218,7 @@ void vdp_init(void)
 	}
 	first_tick = SDL_GetTicks();
 
-	//vdp_set_fps(NTSC_FPS);
+	vdp_set_fps(NTSC_FPS);
 }
 
 
