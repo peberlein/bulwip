@@ -460,8 +460,8 @@ crt_2ntsc(struct CRT *v, struct NTSC_SETTINGS *s)
         if (syA >= s->h) syA = s->h;
         if (syB >= s->h) syB = s->h;
         
-        syA *= s->w;
-        syB *= s->w;
+        syA *= s->pitch;
+        syB *= s->pitch;
         
         reset_iir(&iirY);
         reset_iir(&iirI);
@@ -578,7 +578,7 @@ crt_2ntscFS(struct CRT *v, struct NTSC_SETTINGS *s)
 
         if (sy >= s->h) sy = s->h;
         
-        sy *= s->w;
+        sy *= s->pitch;
         
         reset_iir(&iirY);
         reset_iir(&iirI);
@@ -967,8 +967,10 @@ vsync_found:
             out[i].q = eqf(&eqQ, sig[i] * wave[(i + 3) & 3] >> 9) >> 3;
         }
 
-        cL = v->out + beg * v->outw;
-        cR = cL + v->outw;
+        //cL = v->out + beg * v->outw;
+        //cR = cL + v->outw;
+        cL = v->out + beg * v->outpitch;
+        cR = cL + v->outpitch;
 
         for (pos = scanL; pos < scanR && cL < cR; pos += dx) {
             int y, i, q;
@@ -1008,7 +1010,7 @@ vsync_found:
         /* duplicate extra lines */
         ln = v->outw * sizeof(int);
         for (s = beg + 1; s < end; s++) {
-            memcpy(v->out + s * v->outw, v->out + (s - 1) * v->outw, ln);
+            memcpy(v->out + s * v->outpitch, v->out + (s - 1) * v->outpitch, ln);
         }
     }
 }

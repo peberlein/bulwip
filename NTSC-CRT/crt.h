@@ -34,7 +34,7 @@ extern "C" {
 /* 0 = vertical  chroma (228 chroma clocks per line) */
 /* 1 = checkered chroma (227.5 chroma clocks per line) */
 /* 2 = sawtooth  chroma (227.3 chroma clocks per line) */
-#define CRT_CHROMA_PATTERN 1
+#define CRT_CHROMA_PATTERN 0
 
 #if CRT_NES_MODE
 #undef CRT_CHROMA_PATTERN
@@ -56,7 +56,7 @@ extern "C" {
 #if CRT_NES_HIRES
 #define CRT_CB_FREQ     6 /* carrier frequency relative to sample rate */
 #else
-#define CRT_CB_FREQ     3 /* carrier frequency relative to sample rate */
+#define CRT_CB_FREQ     4 /* or make it 3 for an even blurrier image */
 #endif
 #else
 #define CRT_CB_FREQ     4 /* carrier frequency relative to sample rate */
@@ -75,7 +75,7 @@ struct CRT {
     int hsync, vsync; /* used internally to keep track of sync over frames */
     int hue, brightness, contrast, saturation; /* common monitor settings */
     int black_point, white_point; /* user-adjustable */
-    int outw, outh; /* output width/height */
+    int outw, outh, outpitch; /* output width/height */
     int *out; /* output image */
 };
 
@@ -98,7 +98,7 @@ extern void crt_reset(struct CRT *v);
 
 struct NTSC_SETTINGS {
     const int *rgb; /* 32-bit RGB image data (packed as 0xXXRRGGBB) */
-    int w, h;       /* width and height of image */
+    int w, h, pitch;       /* width and height of image */
     int raw;        /* 0 = scale image to fit monitor, 1 = don't scale */
     int as_color;   /* 0 = monochrome, 1 = full color */
     int field;      /* 0 = even, 1 = odd */
