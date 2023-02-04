@@ -1145,7 +1145,6 @@ void reset(void)
 			load_listing(name, -1);
 			free(name);
 		}
-		toggle_breakpoint(0x601e, -1);
 	}
 }
 
