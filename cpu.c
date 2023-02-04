@@ -31,31 +31,22 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "cpu.h"
 
 
-extern int debug_log(const char *fmt, ...);
-extern int print_asm(const char *fmt, ...);
-
-
-typedef unsigned int u32;
-typedef unsigned short u16;
-typedef signed short s16;
-typedef unsigned char u8;
-typedef signed char s8;
-
-
-#define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 
 // program counter, workspace pointer, status flags
 static u16 gPC, gWP; // st is below with status functions
 static int cyc = 0; // cycle counter (cpu runs until > 0)
 static int interrupt_level = 0; // interrupt level + 1  (call interrupt_check() after modifying)
+static int breakpoint_saved_cyc = 0;
 
 u16 get_pc(void) { return gPC; }
 u16 get_wp(void) { return gWP; }
 u16 get_st(void); // defined below with status functions
 int add_cyc(int add) { cyc += add; return cyc; }
 
+#if 0
 // Setting en will allow the next emu() to return after a single instruction
 // Clearing en will restore the number of saved cycles before returning
 void cpu_break(int en)
@@ -69,11 +60,16 @@ void cpu_break(int en)
 		saved_cyc = 0;
 	}
 }
+#endif
 
-
-// external CRU functions
-extern u8 cru_r(u16 bit);
-extern void cru_w(u16 bit, u8 value);
+void single_step(void)
+{
+	int saved_cyc = cyc;
+	cyc = 0;
+	emu(); // this will return after 1 instruction when cyc=0
+	cyc += saved_cyc;
+	//printf("%s: save=%d cyc=%d\n", __func__, saved_cyc, cyc);
+}
 
 
 
@@ -89,6 +85,23 @@ extern void cru_w(u16 bit, u8 value);
 #define PAGE_MASK (PAGE_SIZE-1)
 #define PAGES_IN_64K (1<<(16-MAP_SHIFT))
 
+#define ALTERNATE_MAPPING
+#ifdef ALTERNATE_MAPPING
+u16 (*map_read_func[PAGES_IN_64K])(u16) = {NULL};
+void (*map_write_func[PAGES_IN_64K])(u16, u16) = {NULL};
+u16 (*map_read_orig_func[PAGES_IN_64K])(u16) = {NULL};
+void (*map_write_orig_func[PAGES_IN_64K])(u16, u16) = {NULL};
+u16 (*map_safe_read_func[PAGES_IN_64K])(u16) = {NULL};
+u16 *map_mem_addr[PAGES_IN_64K] = {NULL};
+
+#define map_read(x) map_read_func[x]
+#define map_write(x) map_write_func[x]
+#define map_read_orig(x) map_read_orig_func[x]
+#define map_write_orig(x) map_write_orig_func[x]
+#define map_safe_read(x) map_safe_read_func[x]
+#define map_mem(x) map_mem_addr[x]
+
+#else
 static struct {
 	u16 (*read)(u16);         // read function
 	u16 (*safe_read)(u16);    // read function without side-effects (but may increment cyc)
@@ -96,39 +109,47 @@ static struct {
 	u16 *mem;                 // memory reference
 } map[PAGES_IN_64K]; // N (1<<MAP_SHIFT) banks
 
+#define map_read(x) map[x].read
+#define map_safe_read(x) map[x].safe_read
+#define map_write(x) map[x].write
+#define map_mem(x) map[x].mem
+#endif
 
 void change_mapping(int base, int size, u16 *mem)
 {
 	int i;
 	for (i = 0; i < size; i += PAGE_SIZE) {
-		map[base >> MAP_SHIFT].mem = mem + (i>>1);
+		map_mem(base >> MAP_SHIFT) = mem + (i>>1);
 		base += PAGE_SIZE;
 	}
 }
 
-void set_mapping_safe(int base,
+void set_mapping_safe(int base, int size,
 	u16 (*read)(u16),
 	u16 (*safe_read)(u16),
 	void (*write)(u16, u16),
 	u16 *mem)
 {
-	int i;
-	base <<= (12-MAP_SHIFT);
-	for (i = 0; i < (1 << (12-MAP_SHIFT)); i++) {
-		map[base+i].read = read;
-		map[base+i].safe_read = safe_read;
-		map[base+i].write = write;
-		map[base+i].mem = mem ? mem + (i << (MAP_SHIFT-1)) : NULL;
+	int i, end;
+	end = (base + size) >> MAP_SHIFT;
+	base >>= MAP_SHIFT;
+	for (i = base; i < end; i++) {
+		map_read(i) = read;
+		map_read_orig(i) = read;
+		map_safe_read(i) = safe_read;
+		map_write(i) = write;
+		map_write_orig(i) = write;
+		map_mem(i) = mem ? mem + ((i-base) << (MAP_SHIFT-1)) : NULL;
 		//printf("map page=%x address=%p\n", base+i, map[base+i].mem);
 	}
 }
 
-void set_mapping(int base,
+void set_mapping(int base, int size,
 	u16 (*read)(u16),
 	void (*write)(u16, u16),
 	u16 *mem)
 {
-	set_mapping_safe(base, read, read, write, mem);
+	set_mapping_safe(base, size, read, read, write, mem);
 }
 
 
@@ -137,35 +158,38 @@ void set_mapping(int base,
  * Memory accessor functions              *
  ******************************************/
 
+#define always_inline inline __attribute((always_inline))
+
 // These may be overridden by debugger for breakpoints/watchpoints
 //static u16 (*iaq_func)(u16); // instruction acquisition
 
-static inline u16 mem_r(u16 address)
+static always_inline u16 mem_r(u16 address)
 {
-	u16 value = map[address >> MAP_SHIFT].read(address);
+	u16 value = map_read(address >> MAP_SHIFT)(address);
 	return value;
 }
 
 u16 safe_r(u16 address)
 {
-	u16 value = map[address >> MAP_SHIFT].safe_read(address);
+	int saved_cyc = cyc;
+	u16 value = map_safe_read(address >> MAP_SHIFT)(address);
+	cyc = saved_cyc;
 	return value;
 }
 
-static inline u16 mem_w(u16 address, u16 value)
+static always_inline void mem_w(u16 address, u16 value)
 {
-	map[address >> MAP_SHIFT].write(address, value);
-	return value;
+	map_write(address >> MAP_SHIFT)(address, value);
 }
 
-static inline u16 reg_r(u16 wp, u8 reg)
+static always_inline u16 reg_r(u16 wp, u8 reg)
 {
 	return mem_r(wp + 2 * reg);
 }
 
-static inline u16 reg_w(u16 wp, u8 reg, u16 value)
+static always_inline void reg_w(u16 wp, u8 reg, u16 value)
 {
-	return mem_w(wp + 2 * reg, value);
+	mem_w(wp + 2 * reg, value);
 }
 
 static void dump_regs(void)
@@ -188,25 +212,72 @@ u16 map_r(u16 address)
 	//printf("%04x page=%x offset=%x value=%04x\n", address, page, offset,
 	//		map[page].mem[offset>>1]);
 
-	if (map[page].mem == NULL) {
+	if (map_mem(page) == NULL) {
 		debug_log("no memory mapped at %04X (read)\n", address);
 		return 0;
 	}
-	return map[page].mem[offset >> 1];
+	return map_mem(page)[offset >> 1];
 }
 
 void map_w(u16 address, u16 value)
 {
 	u8  page = address >> MAP_SHIFT;
 	u16 offset = address & PAGE_MASK;
-	if (map[page].mem == NULL) {
+	if (map_mem(page) == NULL) {
 		debug_log("no memory mapped at %04X (write, %04X)\n", address, value);
 		return;
 	}
-	map[page].mem[offset >> 1] = value;
-	return;
+	map_mem(page)[offset >> 1] = value;
 }
 
+
+// Breakpoint read
+static u16 brk_r(u16 address)
+{
+	//printf("%s: %04X\n", __func__, address);
+	if (breakpoint_read(address)) {
+		breakpoint_saved_cyc = cyc;
+		if (address == gPC) {
+			debug_break = 1;
+			return C99_BRK; // instruction decoder will handle this
+		} else {
+			cyc = 0;
+		}
+	}
+	return map_read_orig(address >> MAP_SHIFT)(address);
+}
+
+// Breakpoint write
+static void brk_w(u16 address, u16 value)
+{
+	map_write_orig(address >> MAP_SHIFT)(address, value);
+	if (breakpoint_write(address)) {
+		breakpoint_saved_cyc = cyc;
+		cyc = 0;
+		debug_break = 1;
+	}
+}
+
+
+void clear_all_breakpoints(void)
+{
+	int i;
+	for (i = 0; i < PAGES_IN_64K; i++) {
+		map_read(i) = map_read_orig(i);
+		map_write(i) = map_write_orig(i);
+	}
+}
+
+void set_breakpoint(u16 base, u16 size)
+{
+	int i, end;
+	end = (base + size) >> MAP_SHIFT;
+	base >>= MAP_SHIFT;
+	for (i = base; i <= end; i++) {
+		map_read(i) = brk_r;
+		map_write(i) = brk_w;
+	}
+}
 
 
 
@@ -229,7 +300,6 @@ enum {
 static u8 st_flg = 0; // status register flags
 static u8 st_int = 0; // status register interrupt mask
 
-#define always_inline inline __attribute((always_inline))
 
 u16 get_st(void) { return ((u16)st_flg << 8) | st_int; }
 static always_inline void set_st(u16 new_st) { st_flg = new_st >> 8; st_int = new_st & ST_IM; }
@@ -277,7 +347,7 @@ static always_inline void status_arith(u16 a, u16 b)
 	}
 }
 
-#define USE_ZERO_TABLE
+//#define USE_ZERO_TABLE
 #ifdef USE_ZERO_TABLE
 // status bits for x compared to zero
 #define ST0(x) ((((x)==0) * ST_EQ) | (((x)>0) * ST_LGT) | (((s16)(x)>(s16)0) * ST_AGT))
@@ -580,24 +650,30 @@ void emu(void)
 {
 	u16 op, pc = gPC, wp = gWP;
 decode_op:
-	if (cyc > 0) {
-		gPC = pc;
-		gWP = wp;
-		return;
-	}
-decode_op_now:
+	// when cycle counter rolls positive, go out and render a scanline
+	if (cyc > 0)
+		goto done;
+
+decode_op_now: // this is used by instructions which cannot be interrupted (XOP, BLWP)
+
 	if (0/*trace*/) {
 		int save_cyc = cyc;
 		disasm(pc);
 		cyc = save_cyc;
 	}
+	gPC = pc;  // breakpoints will need to know the current PC
+
 	op = mem_r(pc);
+	// if this mem read triggers a breakpoint, it will save the cycles
+	// before reading the memory and will return C99_BRK
 	pc += 2;
 execute_op:
 	cyc += 6; // base cycles
 	if (op < 0x0200) goto UNHANDLED;
-	switch (__builtin_clz(op << 16)) {
-	case 0: case 1: {  // opcodes 0x4000 .. 0xffff
+
+	// Try to emit a BSR instruction without the XOR 31
+	switch ((__builtin_clz(op << 16)^31)&7) {
+	case 7-0: case 7-1: {  // opcodes 0x4000 .. 0xffff
 		u16 ts, reg;
 		struct val_addr td;
 		if (op & 0x1000) { // byte op
@@ -666,36 +742,17 @@ execute_op:
 			switch ((op >> 7) & 7) {
 			case 0: goto UNHANDLED;
 			case 1: goto UNHANDLED;
-			case 2: // SZC
-				td.val = status_zero(td.val & ~ts);
-				mem_w_Td(op, wp, td);
-				goto decode_op;
-			case 3: // S
-				//mem_w(td.addr, sub(td.val, ts));
-				td.val = sub(td.val, ts);
-				mem_w_Td(op, wp, td);
-				goto decode_op;
-			case 4: // C
-				status_arith(ts, td.val);
-				Td_post_increment(op, wp, td, 2);
-				goto decode_op;
-			case 5: // A
-				td.val = add(td.val, ts);
-				mem_w_Td(op, wp, td);
-				goto decode_op;
-			case 6: // MOV
-				td.val = status_zero(ts);
-				mem_w_Td(op, wp, td);
-				goto decode_op;
-			case 7: // SOC
-				td.val = status_zero(td.val | ts);
-				mem_w_Td(op, wp, td);
-				goto decode_op;
+			case 2: SZC: td.val = status_zero(td.val & ~ts); mem_w_Td(op, wp, td); goto decode_op;
+			case 3: S: td.val = sub(td.val, ts); mem_w_Td(op, wp, td); goto decode_op;
+			case 4: C: status_arith(ts, td.val); Td_post_increment(op, wp, td, 2); goto decode_op;
+			case 5: A: td.val = add(td.val, ts); mem_w_Td(op, wp, td); goto decode_op;
+			case 6: MOV: td.val = status_zero(ts); mem_w_Td(op, wp, td); goto decode_op;
+			case 7: SOC: td.val = status_zero(td.val | ts); mem_w_Td(op, wp, td); goto decode_op;
 			}
 		}
 		__builtin_unreachable();
 		}
-	case 2:   // opcodes 0x2000 .. 0x3fff
+	case 7-2:   // opcodes 0x2000 .. 0x3fff
 		switch ((op >> 10) & 7) {
 		case 0: { // COC
 			u16 ts = Ts(op, &pc, wp);
@@ -710,9 +767,10 @@ execute_op:
 			goto decode_op;
 			}
 		case 2: { // XOR
+			u8 reg = (op >> 6) & 15;
 			u16 ts = Ts(op, &pc, wp);
-			u16 td = reg_r(wp, (op >> 6) & 15);
-			reg_w(wp, (op >> 6) & 15, status_zero(ts ^ td));
+			u16 td = reg_r(wp, reg);
+			reg_w(wp, reg, status_zero(ts ^ td));
 			goto decode_op;
 			}
 		case 3: { // XOP
@@ -809,7 +867,7 @@ execute_op:
 			}
 		}
 		__builtin_unreachable();
-	case 3: // opcodes 0x1000 .. 0x1fff
+	case 7-3: // opcodes 0x1000 .. 0x1fff
 		switch ((op >> 8) & 15) {
 		case 0: JMP: cyc += 2; pc += 2 * (s8)(op & 0xff); goto decode_op;
 		case 1: JLT: if (tst_LT()) goto JMP; goto decode_op;
@@ -824,44 +882,45 @@ execute_op:
 		case 10: JL: if (tst_L()) goto JMP; goto decode_op;
 		case 11: JH: if (tst_H()) goto JMP; goto decode_op;
 		case 12: JOP: if (tst_OP()) goto JMP; goto decode_op;
-		case 13: SBO: cru_w((op & 0xff) + ((reg_r(wp, 12)&0x1ffe) >> 1), 1); goto decode_op;
-		case 14: SBZ: cru_w((op & 0xff) + ((reg_r(wp, 12)&0x1ffe) >> 1), 0); goto decode_op;
-		case 15: TB: status_equal(cru_r((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1)), 0); goto decode_op;
+		case 13: SBO: cru_w((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1), 1); goto decode_op;
+		case 14: SBZ: cru_w((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1), 0); goto decode_op;
+		case 15: TB: status_equal(cru_r((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1)), 1); goto decode_op;
 		}
 		__builtin_unreachable();
-	case 4: { // opcodes 0x0800 .. 0x0fff  shifts
-		u16 reg = reg_r(wp, op & 15);
+	case 7-4: { // opcodes 0x0800 .. 0x0fff  shifts
+		u16 val = reg_r(wp, op & 15);
 		u8 count = shift_count(op, wp);
 		// TODO these need cycle counts!
+		cyc += 2 * count;
 		switch ((op >> 8) & 3) {
 		case 0: SRA:
-			if (reg & (1 << (count-1))) set_C(); else clr_C();
-			reg_w(wp, op & 15, status_zero(((s16)reg) >> count));
+			if (val & (1 << (count-1))) set_C(); else clr_C();
+			reg_w(wp, op & 15, status_zero(((s16)val) >> count));
 			goto decode_op;
 		case 1: SRL:
-			if (reg & (1 << (count-1))) set_C(); else clr_C();
-			reg_w(wp, op & 15, status_zero(reg >> count));
+			if (val & (1 << (count-1))) set_C(); else clr_C();
+			reg_w(wp, op & 15, status_zero(val >> count));
 			goto decode_op;
 		case 2: SLA:
-			if (reg & (0x8000 >> (count-1))) set_C(); else clr_C();
-			reg_w(wp, op & 15, status_zero(reg << count));
+			if (val & (0x8000 >> (count-1))) set_C(); else clr_C();
+			reg_w(wp, op & 15, status_zero(val << count));
 			// overflow if MSB changes during shift
 			if (count == 16) {
-			  if (reg) set_OV(); else clr_OV();
+				if (val) set_OV(); else clr_OV();
 			} else {
-			  u16 ov_mask = 0xffff << (15 - count);
-			  reg &= ov_mask;
-			  if (reg != 0 && reg != ov_mask) set_OV(); else clr_OV();
+				u16 ov_mask = 0xffff << (15 - count);
+				val &= ov_mask;
+				if (val != 0 && val != ov_mask) set_OV(); else clr_OV();
 			}
 			goto decode_op;
 		case 3: SRC:
-			if (reg & (1 << (count-1))) set_C(); else clr_C();
-			reg_w(wp, op & 15, status_zero((reg << (16-count))|(reg >> count)));
+			if (val & (1 << (count-1))) set_C(); else clr_C();
+			reg_w(wp, op & 15, status_zero((val << (16-count))|(val >> count)));
 			goto decode_op;
 		}
 		__builtin_unreachable();
 		}
-	case 5: { // opcodes 0x0400 .. 0x07ff
+	case 7-5: { // opcodes 0x0400 .. 0x07ff
 		struct val_addr td;
 		switch ((op >> 6) & 15) {
 		case 0: BLWP:
@@ -887,11 +946,11 @@ execute_op:
 		case 11: SWPB: td = Td(op, &pc, wp); td.val = swpb(td.val); mem_w_Td(op, wp, td); goto decode_op;
 		case 12: SETO: td = Td(op, &pc, wp); td.val = 0xffff; mem_w_Td(op, wp, td); goto decode_op;
 		case 13: ABS:
-			td = Td(op, &pc, wp); status_zero(td.val);
-			//st &= ~(ST_OV | ST_C); 
+			td = Td(op, &pc, wp);
+			status_zero(td.val); // status compared to zero before operation
 			clr_OV();
 			clr_C(); // carry is not listed affected in manual, but it is
-			if (td.val & 0x8000) {
+			if (td.val & 0x8000) { // negative? (sign bit set)
 				cyc += 2;
 				if (td.val == 0x8000)
 					set_OV();
@@ -906,7 +965,7 @@ execute_op:
 		}
 		__builtin_unreachable();
 		}
-	case 6: { // opcodes 0x0200 .. 0x03ff
+	case 7-6: { // opcodes 0x0200 .. 0x03ff
 		u8 reg = op & 15;
 		cyc -= 2;
 		switch ((op >> 5) & 15) {
@@ -932,10 +991,19 @@ execute_op:
 	default:
 		printf("%04x: %04x  %d\n", pc, op, (int)__builtin_clz(op));
 		UNHANDLED:
+		if (op == C99_BRK) {
+			if (debug_break == 1) {
+				pc -= 2; // set PC to before this instruction was executed
+				goto done;
+			}
+		}
 		unhandled(pc, op);
 		goto decode_op;
 	}
-	__builtin_unreachable();
+done:
+	gPC = pc;
+	gWP = wp;
+	return;
 }
 
 #else
@@ -1399,6 +1467,8 @@ static u16 disasm_Bs(u16 pc, u16 op, int opsize)
 	}
 	return pc;
 }
+
+int disasm_cyc = 0; // estimated number of cycles during disassembly
 
 // returns number of bytes in the disassembled instruction (2, 4, or 6)
 int disasm(u16 pc)
