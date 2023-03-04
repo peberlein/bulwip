@@ -25,8 +25,7 @@
 #ifdef _MSC_VER
 #define _CRT_SECURE_NO_WARNINGS
 #endif
-#define _GNU_SOURCE 1
-//#define _POSIX_C_SOURCE 1
+#define _GNU_SOURCE 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -102,6 +101,19 @@ unsigned int prev_line(const char *lst, unsigned int len, unsigned int a)
 	return a;
 }
 
+unsigned int step_lines(const char *lst, unsigned int len, unsigned int a, int delta)
+{
+	while (delta < 0) {
+		a = prev_line(lst, len, a);
+		delta++;
+	}
+	while (delta > 0) {
+		a = next_line(lst, len, a);
+		delta--;
+	}
+	return a;
+}
+
 static int count_lines(const char *lst, unsigned int len, unsigned int a)
 {
 	unsigned int b = 0;
@@ -113,6 +125,16 @@ static int count_lines(const char *lst, unsigned int len, unsigned int a)
 	}
 	return ret;
 }
+
+static int line_len(const char *lst, unsigned int offset)
+{
+	int len = 0;
+	while (lst[len] != 0 && lst[len] != '\r' && lst[len] != '\n') {
+		len++;
+	}
+	return len;
+}
+
 
 
 int get_line_pc(const char *lst, unsigned int offset)
@@ -393,6 +415,21 @@ static void draw_listing(struct list_segment *seg, unsigned int *offset, int *li
 		delta--;
 	}
 	vdp_text_window(seg->src + *offset, 80, 30, 640-80*6, 240, *line);
+
+	int i = -1, pc;
+	char bp[32] = "";
+	unsigned int a = step_lines(seg->src, seg->src_len, *offset, *line);
+	//printf("line=%d offset=%u a=%u\n", *line, *offset, a);
+
+	pc = get_line_pc(seg->src, a);
+	if (pc != -1) {
+		i = get_breakpoint(pc, seg->bank);
+		if (i != -1) {
+			sprintf(bp, " BREAKPOINT%s ", i ? "" : " DISABLED");
+			i = 0; // highlight the breakpoint indicator
+		}
+	}
+	vdp_text_window(bp, 30,1, 322,240-8, i);
 }
 
 
@@ -499,7 +536,6 @@ static int crt_filter_menu(void)
 			vdp_text_clear(MENU_X,MENU_Y, w+2,h+1, CLEAR);
 			config_crt_filter = sel-1;
 			vdp_set_filter(); // reinits the screen texture
-			redraw_vdp(); // redraw the screen texture
 			return 0;
 		case -1: return -1;
 		}
@@ -618,6 +654,14 @@ static char* copy_line(char *text, unsigned int offset, unsigned int line)
 }
 
 
+#ifndef _WIN32
+int alphacasesort(const struct dirent **a, const struct dirent **b)
+{
+	return strcasecmp((*a)->d_name, (*b)->d_name);
+}
+#endif
+
+
 static int load_cart_menu(void)
 {
 	static int dir_saved = 0, file_saved = 0;
@@ -667,7 +711,7 @@ rescan:
 #else
 	{
 		struct dirent **namelist;
-		int i, n = scandir(".", &namelist, NULL, alphasort);
+		int i, n = scandir(".", &namelist, NULL, alphacasesort);
 		if (n < 0) {
 			perror("scandir");
 			return 0;
@@ -680,11 +724,8 @@ rescan:
 				append_str(&dirs, "[");
 				append_str(&dirs, d->d_name);
 				append_str(&dirs, "]\n");
-			} else if (d->d_type == DT_REG && len > 4 &&
-				   d->d_name[len-4] == '.' &&
-				   tolower(d->d_name[len-3]) == 'b' &&
-				   tolower(d->d_name[len-2]) == 'i' &&
-				   tolower(d->d_name[len-1]) == 'n') {
+			} else if (d->d_type == DT_REG && len > 4 && 
+				   strcasecmp(d->d_name+len-4, ".bin") == 0) {
 				append_str(&files, d->d_name);
 				append_str(&files, "\n");
 			}
@@ -810,8 +851,278 @@ int main_menu(void)
 		}
 	}
 	menu_active = 0;
-	printf("%s: ret=%d\n", __func__, ret);
 	return ret;
+}
+
+
+static int show_breakpoints(void)
+{
+	extern int menu_active; // sdl.c
+	int ret = 0;
+	int w = 20, h = 0;
+	char *menu = NULL;
+	int len = 0;
+	int i;
+	int address, bank, enabled;
+	while (enum_breakpoint(i++, &address, &bank, &enabled)) {
+		printf("len=%d address=%x bank=%d enabled=%d\n", len, address, bank, enabled);
+		menu = realloc(menu, len + 20);
+		if (bank != -1) {
+			sprintf(menu+len, "%04X:%d%s\n", address, bank,
+				enabled ? "" : "disabled");
+		} else {
+			sprintf(menu+len, "%04X%s\n", address,
+				enabled ? "" : "disabled");
+		}
+		h++;
+		len = strlen(menu);
+	}
+	
+	menu_active = 1;
+
+	vdp_text_clear(0, 0, 320/6,240/8, CLEAR);
+	while (ret == 0) {
+		int len = strlen(menu);
+		int k;
+		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, 0x80000000); // shadow
+		vdp_text_window(menu, w,h, MENU_X,MENU_Y, -1);
+		vdp_text_window(menu, w-2,1, MENU_X+6,MENU_Y+8, -1);
+		k = wait_key();
+		if (k == -1) { ret = -1; break; }
+
+	}
+	menu_active = 0;
+	return ret;
+
+}
+
+
+
+
+char *find_stack = NULL;  // array of string pointers, NULL terminated
+
+static void string_stack_push(char **stack, char *text)
+{
+	char *p = *stack;
+	int len = p ? strlen(p) : 0;
+	int tlen = strlen(text);
+	// check to see if item is already in it
+
+	// otherwise add it to the stack
+
+	// add space for newline and nul terminator
+	p = realloc(p, len + tlen + 2);
+	memmove(p + tlen + 1, p, len + 1);
+	memcpy(p, text, tlen);
+	p[tlen] = '\n';
+	if (len == 0) p[len + tlen + 1] = 0;
+
+	*stack = p;
+}
+
+static int text_entry(char *title, char **stack)
+{
+	extern int menu_active; // sdl.c
+	int ret = 0;
+	int w = 20, h = 3;
+	char menu[] =
+		"====================\n"
+		"=                  =\n"
+		"====================\n";
+	char text[20] = {'_'};
+	unsigned int offset = stack && *stack ? strlen(*stack) : 0;
+
+	{
+		int len = strlen(title);
+		int x = (w - len) / 2;
+
+		menu[x-1] = ' ';
+		menu[x+len] = ' ';
+		memcpy(menu+x, title, len);
+	}
+
+	menu_active = 1;
+
+	vdp_text_clear(0, 0, 320/6,240/8, CLEAR);
+	while (ret == 0) {
+		int len = strlen(text);
+		int k;
+		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, 0x80000000); // shadow
+		vdp_text_window(menu, w,h, MENU_X,MENU_Y, -1);
+		vdp_text_window(text, w-2,1, MENU_X+6,MENU_Y+8, -1);
+		k = wait_key();
+		if (k == -1) { ret = -1; break; }
+		if (k == TI_ENTER) {
+			text[len-1] = 0; // erase underscore
+			string_stack_push(stack, text);
+			ret = 1;
+			break;
+		}
+		if (k == TI_MENU) break;
+		if (k == TI_S+TI_ADDFCTN || k == TI_LEFT1) {
+			if (len > 1) {
+				text[len-2] = '_';
+				text[len-1] = 0;
+			}
+		} else if (k == TI_E+TI_ADDFCTN || k == TI_UP1) {
+			if (*stack && offset > 0) {
+				int len;
+				offset = prev_line(*stack, strlen(*stack), offset);
+
+				
+
+			}
+		} else if (k == TI_S+TI_ADDFCTN || k == TI_DOWN1) {
+			if (*stack) {
+
+			}
+		} else if ((k&0x3f) == TI_CTRL || (k&0x3f) == TI_FCTN || (k&0x3f) == TI_SHIFT) {
+			// do nothing
+		} else if ((k&0x3f) <= TI_Z && ((k&TI_ADDCTRL) == 0) && len < sizeof(text)-2) {
+			const char *table =
+				k & TI_ADDFCTN ?
+				"        "
+				"  '   ~ "
+				"  ?    `"
+				"  _  {[ "
+				"     }] "
+				"  \"  | \\" :
+				k & TI_ADDSHIFT ?
+				"+       "
+				">LO(@SWX"
+				"<KI*#DEC"
+				"MJU&$FRV"
+				"NHY^%GTB"
+				"-:P)!AQZ" :
+				// unshifted
+				"=       "
+				".lo92swx"
+				",ki83dec"
+				"mju74frv"
+				"nhy65gtb"
+				"/;p01aqz";
+			//printf("k=%d  table=%c\n", k&0x3f, table[k&0x3f]);
+			text[len-1] = table[k&0x3f];
+			text[len] = '_';
+			text[len+1] = 0;
+		} else {
+			printf("%d %s%s%s \n", k&0x3f,
+				k&TI_ADDFCTN?" FCTN":"",
+				k&TI_ADDCTRL?" CTRL":"",
+				k&TI_ADDSHIFT?" SHIFT":""
+				);
+		}
+
+
+	}
+	menu_active = 0;
+	//printf("%s: text='%s' ret=%d\n", __func__, text, ret);
+	return ret;
+}
+
+// returns 1 if text was found, otherwise 0
+static int do_find(const char *lst, unsigned int *offset, int *line)
+{
+	if (find_stack == NULL) return 0;
+	unsigned int lst_len = strlen(lst);
+	int i = *line;
+	unsigned int o = *offset;
+
+	for (i = *line; i; i--) {
+		o = next_line(lst, lst_len, o);
+	}
+	int word_len = line_len(find_stack, 0);
+	char word[word_len];
+	memcpy(word, find_stack, word_len);
+	word[word_len] = 0;
+	o = next_line(lst, lst_len, o);
+	char *p = strstr(lst + o, word);
+	printf("word=%s p=%p\n", word, p);
+	if (!p) return 0;
+	// found something
+	o = p - lst;
+	// don't go to prev line if found at start of line
+	if (o > 0 && lst[o-1] != '\n' && lst[o-1] != '\r')
+		*offset = prev_line(lst, lst_len, o);
+	else
+		*offset = o;
+	return 1;
+}
+
+// returns 1 if text was found, otherwise 0
+static int do_find_reverse(const char *lst, unsigned int *offset, int *line)
+{
+	if (find_stack == NULL) return 0;
+	unsigned int lst_len = strlen(lst);
+	int i = *line;
+	unsigned int o = *offset;
+
+	for (i = *line; i; i--) {
+		o = next_line(lst, lst_len, o);
+	}
+	int word_len = line_len(find_stack, 0);
+	char word[word_len];
+	memcpy(word, find_stack, word_len);
+	word[word_len] = 0;
+	const char *p;
+	for (p = lst + o; p >= lst; p--) {
+		if (memcmp(p, word, word_len) == 0)
+			break;
+	}
+
+	//printf("word=%s p=%p\n", word, p);
+	if (p < lst) return 0;
+	// found something
+	o = p - lst;
+	// don't go to prev line if found at start of line
+	if (o > 0 && lst[o-1] != '\n' && lst[o-1] != '\r')
+		*offset = prev_line(lst, lst_len, o);
+	else
+		*offset = o;
+	return 1;
+}
+
+static void print_key(int k)
+{
+	const char *table =
+		k & TI_ADDFCTN ?
+		"        "
+		"  '   ~ "
+		"  ?    `"
+		"  _  {[ "
+		"     }] "
+		"  \"  | \\" :
+		k & TI_ADDSHIFT ?
+		"+       "
+		">LO(@SWX"
+		"<KI*#DEC"
+		"MJU&$FRV"
+		"NHY^%GTB"
+		"-:P)!AQZ" :
+		// unshifted
+		"=       "
+		".lo92swx"
+		",ki83dec"
+		"mju74frv"
+		"nhy65gtb"
+		"/;p01aqz";
+
+	if (k == -1) printf("quit\n");
+	else {
+		char tmp[] =
+		"=       "
+		".lo92swx"
+		",ki83dec"
+		"mju74frv"
+		"nhy65gtb"
+		"/;p01aqz";
+		printf("%c%s%s%s (%c)\n",
+			tmp[k&0x3f],
+			k&TI_ADDFCTN?" FCTN":"",
+			k&TI_ADDSHIFT?" SHIFT":"",
+			k&TI_ADDCTRL?" CTRL":"",
+			table[k&0x3f]);
+	}
 }
 
 
@@ -826,52 +1137,99 @@ debug_refresh:
 
 	unsigned int offset;
 	struct list_segment *seg = listing_search(get_pc(), &offset);
-	int line = 14;
+	int line;
+debug_redraw:
+	line = 14;
 
 	if (seg) {
 		draw_listing(seg, &offset, &line, -line);
 	}
 
-	if (debug_break) mute(1); // turn off sounds while stopped
-	while (debug_break) {
-		if (debug_break == 3) {
+	if (debug_break) {
+		mute(1); // turn off sounds while stopped
+	}
+	while (debug_break != DEBUG_RUN) {
+		if (debug_break == DEBUG_FRAME_STEP) {
 			// frame step
-			debug_break = 1;
-			return 0;
+			debug_break = DEBUG_STOP;
+			return 0; // return to draw one whole frame, then come back here
 		}
-		if (debug_break == 2) {
+		if (debug_break == DEBUG_SINGLE_STEP) {
 			int c = add_cyc(0); // get current cycle count
 			if (c > 0)
 				return 0; // VDP update needed
 
 			single_step();
-			debug_break = 1;
+			debug_break = DEBUG_STOP;
 			goto debug_refresh;
 		}
+
+		int k = wait_key();
+		//print_key(k);
+		if (k == -1) return -1; // quit
+		if (k == TI_MENU) {
+			if (main_menu() == -1) return -1; // quit
+		}
+
 		if (seg) {
-			if (test_key(TI_PAGEUP)) { // PGUP / 9:BACK
-				draw_listing(seg, &offset, &line, -14);
-			} else if (test_key(TI_PAGEDN)) { // PGDN / 6:PROC'D
-				draw_listing(seg, &offset, &line, 14);
-			} else if (test_key(TI_UP1) || test_key(TI_E+TI_ADDFCTN)) {
-				draw_listing(seg, &offset, &line, -1);
-			} else if (test_key(TI_DOWN1) || test_key(TI_X+TI_ADDFCTN)) {
-				draw_listing(seg, &offset, &line, 1);
-			} else if (test_key(TI_B)) {
-				unsigned int i, off = offset;
-				int pc;
-				for (i = 0; i < line; i++)
-					off = next_line(seg->src, seg->src_len, off);
-				pc = get_line_pc(seg->src, off);
-				if (pc != -1) {
-					// breakpoint
-					printf("breakpoint pc=%04X bank=%d\n", pc, seg->bank);
-					toggle_breakpoint(pc, seg->bank);
+			switch (k) {
+			case TI_PAGEUP:  // PGUP / 9:BACK
+				draw_listing(seg, &offset, &line, -14); break;
+			case TI_PAGEDN:  // PGDN / 6:PROC'D
+				draw_listing(seg, &offset, &line, 14); break;
+			case TI_UP1: case TI_E+TI_ADDFCTN:
+				draw_listing(seg, &offset, &line, -1); break;
+			case TI_DOWN1: case TI_X+TI_ADDFCTN:
+				draw_listing(seg, &offset, &line, 1); break;
+			case TI_HOME:
+				offset = 0; line = 0;
+				draw_listing(seg, &offset, &line, 0);
+				break;
+			case TI_END: {
+				unsigned int off;
+				do {
+					off = offset;
+					offset = next_line(seg->src, seg->src_len, offset);
+				} while (off != offset);
+				goto debug_redraw;
+			}
+			case TI_F+TI_ADDCTRL: {
+				int ret = text_entry("FIND", &find_stack);
+				if (ret == -1) return -1;
+				if (ret == 1) {
+					if (do_find(seg->src, &offset, &line))
+						goto debug_redraw;
 				}
+				break;
+			}
+			case TI_G+TI_ADDCTRL+TI_ADDSHIFT:
+				if (do_find_reverse(seg->src, &offset, &line))
+					goto debug_redraw;
+				break;
+
+			case TI_G+TI_ADDCTRL:
+				if (do_find(seg->src, &offset, &line))
+					goto debug_redraw;
+				break;
 			}
 		}
-		if (vdp_update_or_menu() != 0)
-			return -1; // quitting
+		if (k == TI_B) {
+			unsigned int i, off = offset;
+			int pc;
+			for (i = 0; i < line; i++)
+				off = next_line(seg->src, seg->src_len, off);
+			pc = get_line_pc(seg->src, off);
+			if (pc != -1) {
+				// breakpoint
+				printf("breakpoint pc=%04X bank=%d\n", pc, seg->bank);
+				set_breakpoint(pc, seg->bank, BREAKPOINT_TOGGLE);
+				draw_listing(seg, &offset, &line, 0);
+			}
+		} else if (k == TI_5+TI_ADDFCTN) {
+			// F5 list breakpoints
+			if (show_breakpoints() == -1)
+				return -1;
+		}
 	}
 	mute(0);
 	return 0;
