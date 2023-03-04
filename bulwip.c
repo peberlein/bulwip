@@ -26,9 +26,9 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #define _GNU_SOURCE 1
-//#define _POSIX_C_SOURCE 1
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <ctype.h>
@@ -41,8 +41,17 @@
 
 #include "cpu.h"
 
-#ifndef TEST
+#ifdef TEST
+// use compiled roms to avoid I/O
+#define COMPILED_ROMS
+#define ENABLE_GIF
+#else
 #define USE_SDL
+#endif
+
+#ifdef ENABLE_GIF
+#include "gif/gif.h"
+static GifWriter gif;
 #endif
 
 
@@ -51,10 +60,6 @@
 //#define TRACE_CPU
 //#define COMPILED_ROMS
 
-#ifdef TEST
-// use compiled roms to avoid I/O
-#define COMPILED_ROMS
-#endif
 
 #ifdef COMPILED_ROMS
 #include "994arom.h"
@@ -90,12 +95,20 @@ int debug_log(const char *fmt, ...)
 
 static void* my_realloc(void *p, size_t size) { return realloc(p, size); }
 static void my_free(void *p) { free(p); }
+static char* my_strdup(const char *p)
+{
+#ifdef _WIN32
+	return _strdup(p);
+#else
+	return strdup(p);
+#endif
+}
 
 static char asm_text[80] = "";
 
 int print_asm(const char *fmt, ...)
 {
-	{
+	if (0) {
 		va_list ap;
 		int len = strlen(asm_text);
 		va_start(ap, fmt);
@@ -117,7 +130,7 @@ int print_asm(const char *fmt, ...)
 static u16 tms9901_int_mask = 0; // 9901 interrupt mask
 static u8 trace = 1; // disassembly trace flag
 int debug_en = 0;
-int debug_break = 0;
+int debug_break = DEBUG_RUN;
 int config_crt_filter = 0;
 
 static void dbg_break(int en) { debug_en = 1; debug_break = en; }
@@ -573,10 +586,10 @@ static void mem_init(void)
 
 	// memory mapped devices 8000-9fff
 	set_mapping(0x8000, 0x400, ram_8300_r, ram_8300_w, NULL);
-	set_mapping(0x8400, 0x400, sound_8400_r, sound_8400_w, NULL);
-	set_mapping(0x8800, 0x400, vdp_8800_r, vdp_8800_w, NULL);
-	set_mapping(0x8c00, 0x400, vdp_8c00_r, vdp_8c00_w, NULL);
-	set_mapping(0x9000, 0x400, speech_9000_r, speech_9000_w, NULL);
+	set_mapping_safe(0x8400, 0x400, sound_8400_r, zero_r, sound_8400_w, NULL);
+	set_mapping_safe(0x8800, 0x400, vdp_8800_r, vdp_8800_safe_r, vdp_8800_w, NULL);
+	set_mapping_safe(0x8c00, 0x400, vdp_8c00_r, zero_r, vdp_8c00_w, NULL);
+	set_mapping_safe(0x9000, 0x400, speech_9000_r, zero_r, speech_9000_w, NULL);
 	set_mapping(0x9400, 0x400, zero_r, zero_w, NULL);
 	set_mapping_safe(0x9800, 0x400, grom_9800_r, safe_grom_9800_r, zero_w, NULL);
 	set_mapping(0x9c00, 0x400, zero_r, grom_9c00_w, NULL);
@@ -598,32 +611,43 @@ u8 keyboard[8] = {0}, keyboard_down[8] = {0};
 static u8 keyboard_row = 0;
 static u8 timer_mode = 0;
 static unsigned int total_cycles = 0;
+static u8 alpha_lock = 0;
 
 void set_key(int key, int val)
 {
 	int row = (key >> 3) & 7, col = key & 7, mask = val << col;
 	keyboard[row] = (keyboard[row] & ~(1 << col)) | mask;
-	keyboard_down[row] |= mask;
+	if (val) {
+		//printf("key=%d row=%d\n", key, row);
+		keyboard_down[row] |= 1 << col;
+	} else {
+		keyboard_down[row] &= ~(1 << col);
+	}
+	alpha_lock = !!(key & TI_ALPHALOCK);
 }
 
+#ifndef TEST
 // returns a single keydown enum from TI_*
 int wait_key(void)
 {
+	extern int menu_active; // sdl.c
 	int i;
 	do {
 		for (i = 0; i < ARRAY_SIZE(keyboard_down); i++) {
-			u8 b = keyboard_down[i];
+			int b = keyboard_down[i];
 			if (b == 0) continue;
 			// get only one key
 			b = __builtin_ctz(b);
 			keyboard_down[i] &= ~(1 << b);
-			if (keyboard[0] & (1<<TI_FCTN))
-				b |= TI_ADDFCTN;
-			else if (keyboard[0] & (1<<TI_SHIFT))
-				b |= TI_ADDSHIFT;
-			return i*8+b;
+			if (keyboard[0] & (1<<TI_FCTN)) b += TI_ADDFCTN;
+			if (keyboard[0] & (1<<TI_CTRL)) b += TI_ADDCTRL;
+			if (keyboard[0] & (1<<TI_SHIFT)) b += TI_ADDSHIFT;
+			return (i&7)*8+b;
 		}
-	} while (vdp_update() == 0);
+		i = vdp_update();
+		if (menu_active == 0 && debug_en && debug_break != DEBUG_STOP)
+			return 0;
+	} while (i != -1);
 	return -1; // Window closed
 }
 
@@ -631,20 +655,139 @@ int test_key(int key)
 {
 	int row = (key >> 3) & 7, col = key & 7, mask = 1 << col;
 	if (keyboard_down[row] & mask) {
-		//printf("row=%d mask=%d key=%02x\n", row, mask, 
-		if ((key & 0xc0) == TI_ADDSHIFT) {
-			if ((keyboard[0] & (1 << TI_SHIFT)) == 0) return 0;
-			mask |= TI_SHIFT;
-		} else if ((key & 0xc0) == TI_ADDFCTN) {
-			if ((keyboard[0] & (1 << TI_FCTN)) == 0) return 0;
-			mask |= TI_FCTN;
-		}
+		printf("row=%d mask=%x key=%02x\n", row, mask, key);
+		if ((key & TI_ADDFCTN) && !(keyboard[0] & (1<<TI_FCTN))) return 0;
+		if ((key & TI_ADDCTRL) && !(keyboard[0] & (1<<TI_CTRL))) return 0;
+		if ((key & TI_ADDSHIFT) && !(keyboard[0] & (1<<TI_SHIFT))) return 0;
 		keyboard_down[row] ^= mask; // toggle it off
 		return 1;
 	}
 	return 0;
 }
+#endif
 
+void reset_keys(void)
+{
+	memset(&keyboard_down, 0, sizeof(keyboard_down)); // clear keys
+}
+
+int key_pressed(void)
+{
+	static const u8 zero[ARRAY_SIZE(keyboard_down)] = {};
+	return !memcmp(zero, keyboard_down, ARRAY_SIZE(keyboard_down));
+}
+
+void reset_ti_keys(void)
+{
+	memset(&keyboard, 0, sizeof(keyboard)); // clear keys
+}
+
+int ti_key_pressed(void)
+{
+	static const u8 zero[ARRAY_SIZE(keyboard)] = {};
+	return !memcmp(zero, keyboard, ARRAY_SIZE(keyboard));
+}
+
+int char2key(char ch)
+{
+	char map[] = {
+		TI_SPACE, // ' '
+		TI_ADDSHIFT|TI_1,  // !
+		TI_ADDFCTN|TI_P,  // "
+		TI_ADDSHIFT|TI_3,  // #
+		TI_ADDSHIFT|TI_4,  // $
+		TI_ADDSHIFT|TI_5,  // %
+		TI_ADDSHIFT|TI_7,  // &
+		TI_ADDFCTN|TI_O,  // '
+		TI_ADDSHIFT|TI_9,  // (
+		TI_ADDSHIFT|TI_0,  // )
+		TI_ADDSHIFT|TI_8,  // *
+		TI_ADDSHIFT|TI_EQUALS,  // +
+		TI_COMMA,  // ,
+		TI_ADDSHIFT|TI_SLASH,  // -
+		TI_PERIOD,  // .
+		TI_SLASH,  // /
+		TI_0,  // 0
+		TI_1,  // 1
+		TI_2,  // 2
+		TI_3,  // 3
+		TI_4,  // 4
+		TI_5,  // 5
+		TI_6,  // 6
+		TI_7,  // 7
+		TI_8,  // 8
+		TI_9,  // 9
+		TI_ADDSHIFT|TI_SEMICOLON,  // :
+		TI_SEMICOLON,  // ;
+		TI_ADDSHIFT|TI_COMMA,  // <
+		TI_EQUALS,  // =
+		TI_ADDSHIFT|TI_PERIOD,  // >
+		TI_ADDFCTN|TI_I,  // ?
+		TI_ADDSHIFT|TI_2,  // @
+		TI_A,  // A
+		TI_B,  // B
+		TI_C,  // C
+		TI_D,  // D
+		TI_E,  // E
+		TI_F,  // F
+		TI_G,  // G
+		TI_H,  // H
+		TI_I,  // I
+		TI_J,  // J
+		TI_K,  // K
+		TI_L,  // L
+		TI_M,  // M
+		TI_N,  // N
+		TI_O,  // O
+		TI_P,  // P
+		TI_Q,  // Q
+		TI_R,  // R
+		TI_S,  // S
+		TI_T,  // T
+		TI_U,  // U
+		TI_V,  // V
+		TI_W,  // W
+		TI_X,  // X
+		TI_Y,  // Y
+		TI_Z,  // Z
+		TI_ADDFCTN|TI_R,  // [
+		TI_ADDFCTN|TI_Z,  // \ .
+		TI_ADDFCTN|TI_T,  // ]
+		TI_ADDSHIFT|TI_6,  // ^
+		TI_ADDFCTN|TI_U,  // _
+		TI_ADDSHIFT|TI_A,  // a
+		TI_ADDSHIFT|TI_B,  // b
+		TI_ADDSHIFT|TI_C,  // c
+		TI_ADDSHIFT|TI_D,  // d
+		TI_ADDSHIFT|TI_E,  // e
+		TI_ADDSHIFT|TI_F,  // f
+		TI_ADDSHIFT|TI_G,  // g
+		TI_ADDSHIFT|TI_H,  // h
+		TI_ADDSHIFT|TI_I,  // i
+		TI_ADDSHIFT|TI_J,  // j
+		TI_ADDSHIFT|TI_K,  // k
+		TI_ADDSHIFT|TI_L,  // l
+		TI_ADDSHIFT|TI_M,  // m
+		TI_ADDSHIFT|TI_N,  // n
+		TI_ADDSHIFT|TI_O,  // o
+		TI_ADDSHIFT|TI_P,  // p
+		TI_ADDSHIFT|TI_Q,  // q
+		TI_ADDSHIFT|TI_R,  // r
+		TI_ADDSHIFT|TI_S,  // s
+		TI_ADDSHIFT|TI_T,  // t
+		TI_ADDSHIFT|TI_U,  // u
+		TI_ADDSHIFT|TI_V,  // v
+		TI_ADDSHIFT|TI_W,  // w
+		TI_ADDSHIFT|TI_X,  // x
+		TI_ADDSHIFT|TI_Y,  // y
+		TI_ADDSHIFT|TI_Z,  // z
+		TI_ADDFCTN|TI_F,  // {
+		TI_ADDFCTN|TI_A,  // |
+		TI_ADDFCTN|TI_G,  // }
+		TI_ADDFCTN|TI_W,  // ~
+	};
+	return ch >= 32 && ch < 127 ? map[ch-32] : 0;
+}
 
 /****************************************
  * CRU read/write                       *
@@ -670,7 +813,7 @@ u8 cru_r(u16 bit)
 	case 10://       X C V B Z
 		if (keyboard_row & 8) {
 			// CRU 21 is set ALPHA-LOCK
-			return bit != 7;
+			return bit == 7 ? 1^alpha_lock : 1;
 		}
 		return ((keyboard[keyboard_row] >> (bit-3)) & 1)^1; // active low
 
@@ -704,6 +847,7 @@ void cru_w(u16 bit, u8 value)
 		break;
 	case 21:
 		value ^= 1; // Set ALPHA-LOCK (invert it)
+		// fall thru
 	case 18: //keyboard_row = (keyboard_row & ~1) | (value & 1); break;
 	case 19: //keyboard_row = (keyboard_row & ~2) | ((value & 1) << 1); break;
 	case 20: //keyboard_row = (keyboard_row & ~4) | ((value & 1) << 2); break;
@@ -739,6 +883,475 @@ void unhandled(u16 pc, u16 op)
 }
 
 
+/****************************************
+ * VDP scanline rendering               *
+****************************************/
+
+
+// clamp number between 0.0 and 1.0
+#define CLAMP(x) ((x) < 0 ? 0 : (x) > 1 ? 1 : (x))
+// take values from 0.0 to 1.0
+#if 1
+// YUV to RGB for analog TV
+#define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.000*Y               +1.140*(Cb-0.5))*255)<<16) | \
+                          ((int)(CLAMP(1.000*Y-0.395*(Cr-0.5)-0.581*(Cb-0.5))*255)<<8)  | \
+			  ((int)(CLAMP(1.000*Y+2.032*(Cr-0.5)               )*255)))
+#elif 0
+// YCbCr to RGB for SDTV
+#define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.164*Y               +1.596*(Cb-0.5))*255)<<16) | \
+                          ((int)(CLAMP(1.164*Y-0.392*(Cr-0.5)-0.813*(Cb-0.5))*255)<<8)  | \
+			  ((int)(CLAMP(1.164*Y+2.017*(Cr-0.5)               )*255)))
+#elif 0
+// Full-range YCbCr to RGB for SDTV
+#define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.000*Y               +1.400*(Cb-0.5))*255)<<16) | \
+                          ((int)(CLAMP(1.000*Y-0.343*(Cr-0.5)-0.711*(Cb-0.5))*255)<<8)  | \
+			  ((int)(CLAMP(1.000*Y+1.765*(Cr-0.5)               )*255)))
+#endif
+
+unsigned int palette[16] = {
+#if 0
+// http://atariage.com/forums/topic/238672-rgb-color-codes-for-ti-994a-colors/
+	0x000000, // transparent
+	0x000000, // black
+	0x46b83c, // medium green
+	0x7ccf70, // light green
+	0x5d4fff, // dark blue
+	0x7f71ff, // light blue
+	0xb66247, // dark red
+	0x5cc7ee, // cyan
+	0xd86b48, // medium red
+	0xfb8f6c, // light red
+	0xc3ce42, // dark yellow
+	0xd3db77, // light yellow
+	0x3ea030, // dark green
+	0xb664c6, // magenta
+	0xcdcdcd, // gray
+	0xffffff, // white
+#elif 0
+// TMS https://www.smspower.org/maxim/forumstuff/colours.html
+	0x000000, // transparent
+	0x000000, // black
+	0x47b73b, // medium green
+	0x7ccf6f, // light green
+	0x5d4eff, // dark blue
+	0x8072ff, // light blue
+	0xb66247, // dark red
+	0x5dc8ed, // cyan
+	0xd76b48, // medium red
+	0xfb8f6c, // light red
+	0xc3cd41, // dark yellow
+	0xd3da76, // light yellow
+	0x3e9f2f, // dark green
+	0xb664c7, // magenta
+	0xcccccc, // gray
+	0xffffff, // white
+#elif 0
+// SMS https://www.smspower.org/forums/post37531#37531
+	0x000000, // transparent
+	0x000000, // black
+	0x00aa00, // medium green
+	0x00ff00, // light green
+	0x000055, // dark blue
+	0x0000ff, // light blue
+	0x550000, // dark red
+	0x00ffff, // cyan
+	0xaa0000, // medium red
+	0xff0000, // light red
+	0x555500, // dark yellow
+	0xffff00, // light yellow
+	0x005500, // dark green
+	0xff00ff, // magenta
+	0x555555, // gray
+	0xffffff, // white
+#else
+// http://www.unige.ch/medecine/nouspikel/ti99/tms9918a.htm#Colors
+// taken from TMS9918A/TMS9928A/TMS9929A Video Display Processors TABLE 2-3
+	0x000000, // transparent
+	YUV2RGB(0.00, 0.47, 0.47), // black
+	YUV2RGB(0.53, 0.07, 0.20), // medium green
+	YUV2RGB(0.67, 0.17, 0.27), // light green
+	YUV2RGB(0.40, 0.40, 1.00), // dark blue
+	YUV2RGB(0.53, 0.43, 0.93), // light blue
+	YUV2RGB(0.47, 0.83, 0.30), // dark red
+	YUV2RGB(0.67, 0.00, 0.70), // cyan   NOTE! 992X use Luma .73
+	YUV2RGB(0.53, 0.93, 0.27), // medium red
+	YUV2RGB(0.67, 0.93, 0.27), // light red
+	YUV2RGB(0.73, 0.57, 0.07), // dark yellow
+	YUV2RGB(0.80, 0.57, 0.17), // light yellow
+	YUV2RGB(0.47, 0.13, 0.23), // dark green
+	YUV2RGB(0.53, 0.73, 0.67), // magenta
+	YUV2RGB(0.80, 0.47, 0.47), // gray
+	YUV2RGB(1.00, 0.47, 0.47), // white
+#endif
+};
+
+
+
+#define TOPBORD 24
+#define BOTBORD 24
+#define LFTBORD 32
+#define RGTBORD 32
+#define SPRITES_PER_LINE 4
+#define EARLY_CLOCK_BIT 0x80
+#define FIFTH_SPRITE 0x40
+#define SPRITE_COINC 0x20
+
+static int config_sprites_per_line = SPRITES_PER_LINE;
+
+void vdp_line(unsigned int line,
+		unsigned char* restrict reg,
+		unsigned char* restrict ram)
+{
+	uint32_t *pixels;
+	int pitch = 0;
+	int len = 320;
+	int bord = LFTBORD;
+	uint32_t bg = palette[reg[7] & 0xf];
+	uint32_t fg = palette[(reg[7] >> 4) & 0xf];
+
+	palette[0] = palette[(reg[7] & 0xf) ?: 1];
+
+	if ((reg[0] & 6) == 4 && (reg[1] & 0x18) == 0x10) {
+		// 80-col text mode
+		len *= 2;
+		bord *= 2;
+	}
+
+	vdp_lock_texture(line, len, (void**)&pixels, &pitch);
+
+	if (line < TOPBORD || line >= TOPBORD+192 || (reg[1] & 0x40) == 0) {
+		// draw border or blanking
+		for (int i = 0; i < len; i++) {
+			*pixels++ = bg;
+		}
+	} else {
+		unsigned int sy = line - TOPBORD; // screen y, adjusted for border
+		unsigned char *scr = ram + (reg[2] & 0xf) * 0x400;
+		unsigned char *col = ram + reg[3] * 0x40;
+		unsigned char *pat = ram + (reg[4] & 0x7) * 0x800 + (sy & 7);
+
+		// draw left border
+		for (int i = 0; i < bord; i++) {
+			*pixels++ = bg;
+		}
+
+		uint32_t *save_pixels = pixels;
+
+		// draw graphics
+		unsigned char mode = (reg[0] & 0x02) | (reg[1] & 0x18);
+
+		if (mode == 0x0) {
+			// mode 1 (standard)
+			scr += (sy / 8) * 32;
+
+			for (unsigned char i = 32; i; i--) {
+				unsigned char
+					ch = *scr++,
+					c = col[ch >> 3];
+				unsigned int
+					fg = palette[c >> 4],
+					bg = palette[c & 15];
+				ch = pat[ch * 8];
+				for (unsigned char j = 0x80; j; j >>= 1)
+					*pixels++ = ch & j ? fg : bg;
+			}
+		} else if (mode & 0x10) {
+			unsigned char i = len == 640 ? 80 : 40;
+			// text mode(s)
+			scr += (sy / 8) * i;
+			for (int i = 0; i < bord/4; i++) {
+				*pixels++ = bg;
+			}
+			if (mode == 0x10) {
+				for (; i; i--) {
+					unsigned char ch = *scr++;
+					ch = pat[ch * 8];
+					for (unsigned char j = 0x80; j != 2; j >>= 1)
+						*pixels++ = ch & j ? fg : bg;
+				}
+			} else if (mode == 0x12) { // text bitmap
+				unsigned int patmask = ((reg[4]&3)<<11)|(0x7ff);
+				pat = ram + (reg[4] & 0x04) * 0x800 +
+					(((sy / 64) * 2048) & patmask) + (sy & 7);
+				for (; i; i--) {
+					unsigned char ch = *scr++;
+					ch = pat[ch * 8];
+					for (unsigned char j = 0x80; j != 2; j >>= 1)
+						*pixels++ = ch & j ? fg : bg;
+				}
+			} else { // illegal mode (40 col, 4px fg, 2px bg)
+				for (; i; i--) {
+					*pixels++ = fg;
+					*pixels++ = fg;
+					*pixels++ = fg;
+					*pixels++ = fg;
+					*pixels++ = bg;
+					*pixels++ = bg;
+				}
+			}
+			for (int i = 0; i < bord/4; i++) {
+				*pixels++ = bg;
+			}
+
+		} else if (mode == 0x02) {
+			// mode 2 (bitmap)
+
+			// masks for hybrid modes
+			unsigned int colmask = ((reg[3] & 0x7f) << 6) | 0x3f;
+			unsigned int patmask = ((reg[4] & 3) << 11) | (colmask & 0x7ff);
+
+			scr += (sy / 8) * 32;  // get row
+
+			col = ram + (reg[3] & 0x80) * 0x40 +
+				(((sy / 64) * 2048) & colmask) + (sy & 7);
+			pat = ram + (reg[4] & 0x04) * 0x800 +
+				(((sy / 64) * 2048) & patmask) + (sy & 7);
+
+			// TODO handle bitmap modes
+			for (unsigned char i = 32; i; i--) {
+				unsigned char
+					ch = *scr++,
+					c = col[(ch & patmask) * 8];
+				unsigned int
+					fg = palette[c >> 4],
+					bg = palette[c & 15];
+				ch = pat[(ch & colmask) * 8];
+				for (unsigned char j = 0x80; j; j >>= 1)
+					*pixels++ = ch & j ? fg : bg;
+			}
+		} else if (mode == 0x08) {
+			// multicolor 64x48 pixels
+			pat -= (sy & 7); // adjust y offset
+			pat += ((sy / 4) & 7);
+
+			scr += (sy / 8) * 32;  // get row
+
+			for (unsigned char i = 32; i; i--) {
+				unsigned char
+					ch = *scr++,
+					c = pat[ch * 8];
+				unsigned int
+					fg = palette[c >> 4],
+					bg = palette[c & 15];
+				for (unsigned char j = 0; j < 4; j++)
+					*pixels++ = fg;
+				for (unsigned char j = 0; j < 4; j++)
+					*pixels++ = bg;
+			}
+
+		}
+
+		// draw right border
+		for (int i = 0; i < bord; i++) {
+			*pixels++ = bg;
+		}
+		pixels = save_pixels;
+
+		// no sprites in text mode
+		if (!(reg[1] & 0x10)) {
+			unsigned char sp_size = (reg[1] & 2) ? 16 : 8;
+			unsigned char sp_mag = sp_size << (reg[1] & 1); // magnified sprite size
+			unsigned char *sl = ram + (reg[5] & 0x7f) * 0x80; // sprite list
+			unsigned char *sp = ram + (reg[6] & 0x7) * 0x800; // sprite pattern table
+			unsigned char coinc[256] = {0};
+
+			// draw sprites  (TODO limit 4 sprites per line, and higher priority sprites)
+			struct {
+				unsigned char *p;  // Sprite pattern data
+				unsigned char x;   // X-coordinate
+				unsigned char f;   // Color and early clock bit
+			} sprites[32]; // TODO Sprite limit hardcoded at 4
+			int sprite_count = 0;
+
+			for (unsigned char i = 0; i < 32; i++) {
+				unsigned int dy = sy;
+				unsigned char y = *sl++; // Y-coordinate minus 1
+				unsigned char x = *sl++; // X-coordinate
+				unsigned char s = *sl++; // Sprite pattern index
+				unsigned char f = *sl++; // Flags and color
+
+				if (y == 0xD0) // Sprite List terminator
+					break;
+				if (y > 0xD0)
+					dy += 256; // wraps around top of screen
+				if (y+1+sp_mag <= dy || y+1 > dy)
+					continue; // not visible
+				if (sp_size == 16)
+					s &= 0xfc; // mask sprite index
+
+				//if (f & 15)
+				//	printf("%d %x %d %d %d %02x %02x\n", sy, (reg[5]&0x7f)*0x80, sprite_count, y, x, s, f);
+				if (sprite_count == SPRITES_PER_LINE && (reg[8] & FIFTH_SPRITE) == 0) {
+					reg[8] &= 0xe0;
+					reg[8] |= FIFTH_SPRITE + i;
+				}
+				if (sprite_count >= config_sprites_per_line)
+					break;
+
+				sprites[sprite_count].p = sp + (s * 8) + (dy - (y+1));
+				sprites[sprite_count].x = x;
+				sprites[sprite_count].f = f;
+				sprite_count++;
+			}
+			// draw in reverse order so that lower sprite index are higher priority
+			while (sprite_count > 0) {
+				sprite_count--;
+				unsigned char *p = sprites[sprite_count].p; // pattern pointer
+				int x = sprites[sprite_count].x;
+				unsigned char f = sprites[sprite_count].f; // flags and color
+				unsigned int c = palette[f & 0xf];
+				unsigned int mask = (p[0] << 8) | p[16]; // bit mask of solid pixels
+				int count = sp_mag; // number of pixels to draw
+				int inc_mask = (reg[1] & 1) ? 1 : 0xff;
+
+
+				//printf("%d %d %d %04x\n", sprite_count, x, f, mask);
+				if (f & EARLY_CLOCK_BIT) {
+					x -= 32;
+					while (count > 0 && x < 0) {
+						if (count & inc_mask)
+							mask <<= 1;
+						++x;
+						count--;
+					}
+				}
+
+				while (count > 0) {
+					if (mask & 0x8000) {
+						if (f != 0)  // don't draw transparent color
+							pixels[x] = c;
+						reg[8] |= coinc[x];
+						coinc[x] = SPRITE_COINC;
+					}
+					if (count & inc_mask)
+						mask <<= 1;
+					if (++x >= 256)
+						break;
+					count--;
+				}
+			}
+		}
+	}
+	vdp_unlock_texture();
+}
+
+void redraw_vdp(void)
+{
+	int y;
+	for (y = 0; y < 240; y++) {
+		vdp_line(y, vdp.reg, vdp.ram);
+	}
+}
+
+static void print_name_table(u8* reg, u8 *ram)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	unsigned char *line = ram + (reg[2]&0xf)*0x400;
+	int offset = (reg[2]&0xf) == 0 && (reg[4]&0x7) == 0 ?
+			0x60 : 0; // use 0 for no offset, 0x60 for XB
+	int y, x, w = (reg[1] & 0x10) ? 40 : 32;
+	for (y = 0; y < 24; y++) {
+		for (x = 0; x < w; x++) {
+			unsigned char c = *line++ - offset;
+			printf("%c%c",
+				c >= ' ' && c < 127 ? ' ' : hex[(c+offset)>>4],
+				c >= ' ' && c < 127 ? c   : hex[(c+offset)&15]);
+		}
+		printf("\n");
+	}
+	//printf("Regs: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	//	reg[0],reg[1],reg[2],reg[3],reg[4],reg[5],reg[6],reg[7]);
+	// TI BASIC 00 e0 f0 0c f8 86 f8 07
+	// XB       00 e0 00 20 00 06 00 07
+}
+
+
+#ifndef USE_SDL
+
+static uint32_t frame_buffer[320*240];
+
+void vdp_lock_texture(int line, int len, void**pixels, int *pitch)
+{
+	*pixels = frame_buffer + line*320;
+	*pitch = 320;
+}
+void vdp_unlock_texture(void)
+{
+}
+
+
+void vdp_init(void)
+{
+}
+
+void vdp_done(void)
+{
+}
+
+char **test_argv = NULL;
+int test_argc = 0;
+
+int vdp_update(void)
+{
+	static int countdown = 0;
+	static char *type_text = NULL;
+	if (type_text) {
+		if (type_text[0] == 0) {
+			type_text = NULL;
+		} else if (ti_key_pressed()) {
+			reset_ti_keys();
+			type_text++;
+		} else {
+			int k = char2key(type_text[0]);
+			if (k&TI_ADDFCTN) set_key(TI_FCTN,1);
+			if (k&TI_ADDCTRL) set_key(TI_CTRL,1);
+			if (k&TI_ADDSHIFT) set_key(TI_SHIFT,1);
+			set_key(k & 0x3f, 1);
+		}
+	} else if (countdown) {
+		countdown--;
+	} else if (test_argc > 0) {
+		
+
+	}
+
+	static int frames = 0;
+	if (frames == 82 || frames == 112) {
+		set_key(TI_1, 1);
+		//print_name_table(vdp.reg, vdp.ram);
+
+	} else if (frames == 88 || frames == 116) {
+		set_key(TI_1, 0);
+	}
+	frames++;
+	return frames >= 600;
+}
+
+#define unused __attribute__((unused))
+
+
+void vdp_text_pat(unused unsigned char *pat)
+{
+}
+
+void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight_line)
+{
+}
+
+void vdp_set_fps(unused int mfps /* fps*1000 */)
+{
+}
+
+void mute(unused int en)
+{
+}
+
+int debug_window(void)
+{
+	return 0;
+}
+#endif
+
 
 
 
@@ -750,17 +1363,18 @@ void unhandled(u16 pc, u16 op)
 
 static char *argv0_dir_name = NULL;
 
-static int load_rom(char *filename, u16 **dest_ptr, unsigned int *size_ptr, unsigned int base)
+// Load a ROM cartridge, allocating memory into dest_ptr, appending to image as necessary
+// Returns 0 on success, -1 on error or insufficient read
+static int load_rom(char *filename, u16 **dest_ptr, unsigned int *size_ptr)
 {
 	FILE *f = fopen(filename, "rb");
 	u16 *dest = *dest_ptr;
-	unsigned int size = size_ptr ? *size_ptr : 0;
-	unsigned int i;
+	unsigned int i, size, buf_size = size_ptr ? *size_ptr : 0;
 
 #ifdef COMPILED_ROMS
 	for (i = 0; i < ARRAY_SIZE(comp_roms); i++) {
-		if (strcmp(comp_roms[i].name, filename) == 0) {
-			*dest_ptr = comp_roms[i].data;
+		if (strcmp(comp_roms[i].filename, filename) == 0) {
+			*dest_ptr = (u16*) comp_roms[i].data;
 			*size_ptr = comp_roms[i].len;
 			return 0;
 		}
@@ -784,16 +1398,18 @@ static int load_rom(char *filename, u16 **dest_ptr, unsigned int *size_ptr, unsi
 	if (fseek(f, 0, SEEK_SET) < 0)
 		perror("fseek SEEK_SET");
 
-	if (base == 0 && *size_ptr != 0 && size != *size_ptr) {
-		fprintf(stderr, "ROM %s size expected %d, not %d\n", filename, *size_ptr, size);
+	if (buf_size != 0 && size != buf_size) {
+		fprintf(stderr, "ROM %s size expected %d, not %d\n", filename, buf_size, size);
+		size = buf_size;
 	}
 
-	if (!dest || base + size > *size_ptr) {
-		*size_ptr = (base + size + 0x1fff) & ~0x1fff; // round up to nearest 8k
-		dest = my_realloc(dest, *size_ptr);
+	if (!dest || size > buf_size) {
+		buf_size = (size + 0x1fff) & ~0x1fff; // round up to nearest 8k
+		dest = my_realloc(dest, buf_size);
 		*dest_ptr = dest;
+		if (size_ptr) *size_ptr = buf_size;
 	}
-	dest += base/2; // base is bytes, dest is word ptr
+
 	for (i = 0; i < size; i += 2) {
 		u8 buf[2];
 		if (fread(buf, 1, 2, f) < 2) {
@@ -804,11 +1420,8 @@ static int load_rom(char *filename, u16 **dest_ptr, unsigned int *size_ptr, unsi
 		*dest++ = buf[1] + (buf[0] << 8);
 	}
 	fclose(f);
-	debug_log("loaded ROM %d/%d\n", i, size);
-	if (i < size) {
-		return -1; //exit(1);
-	}
-	return 0;
+	printf("loaded ROM %d/%d\n", i, size);
+	return i < size ? -1 : 0;
 }
 
 static int load_grom(char *filename, u8 **dest_ptr, unsigned int *size_ptr)
@@ -818,8 +1431,8 @@ static int load_grom(char *filename, u8 **dest_ptr, unsigned int *size_ptr)
 #ifdef COMPILED_ROMS
 	unsigned int i;
 	for (i = 0; i < ARRAY_SIZE(comp_roms); i++) {
-		if (strcmp(comp_roms[i].name, filename) == 0) {
-			*dest_ptr = comp_roms[i].data;
+		if (strcmp(comp_roms[i].filename, filename) == 0) {
+			*dest_ptr = (u8*) comp_roms[i].data;
 			*size_ptr = comp_roms[i].len;
 			return 0;
 		}
@@ -852,82 +1465,88 @@ static int load_grom(char *filename, u8 **dest_ptr, unsigned int *size_ptr)
 	}
 	if (*dest_ptr) {
 		int n = fread(*dest_ptr, 1, *size_ptr, f);
-		printf("%d\n", n);
+		if (n < *size_ptr) {
+			debug_log("Failed to read GROM...\n");
+		}
 	}
 	fclose(f);
 	return 0;
 }
 
 
-static void print_name_table(u8* reg, u8 *ram)
+
+/****************************************
+ * Clipboard/text pasting function      *
+ ****************************************/
+
+static char *paste_str = NULL;
+static int paste_idx = 0;
+static int paste_old_fps = 0;
+static int paste_kscan_address = 0x0478; // 99/4A ROM only
+
+void paste_cancel(void)
 {
-	static const char hex[] = "0123456789ABCDEF";
-	unsigned char *line = ram + (reg[2]&0xf)*0x400;
-	int y, x, w = (reg[1] & 0x10) ? 40 : 32;
-	for (y = 0; y < 24; y++) {
-		for (x = 0; x < w; x++) {
-			unsigned char c = *line++;
-			printf("%c%c",
-				c >= ' ' && c < 127 ? c   : hex[c>>4],
-				c >= ' ' && c < 127 ? ' ' : hex[c&15]);
+	if (!paste_str) return;
+	free(paste_str);
+	paste_str = NULL;
+	set_breakpoint(paste_kscan_address, -1, BREAKPOINT_DISABLE);
+	vdp_set_fps(paste_old_fps);
+}
+
+static void paste_char(void)
+{
+	// Borrowed from Classic99 Mike Brent
+	u8 b = fast_ram[0x74>>1] >> 8;
+
+	if (paste_str == NULL) return;
+	if (b == 0 || b == 5) {
+		u8 c = paste_str[paste_idx++];
+		if (c == 10) { // LF
+			if (paste_idx >= 2 && paste_str[paste_idx-2] == 13) {
+				// if prev char was CR then don't output this one
+				return;
+			}
+			c = 13; // LF to CR
 		}
-		printf("\n");
+		printf("b=%d  %04x %04x %d %c\n", b, fast_ram[0x74>>1],
+				fast_ram[0x7c>>1],
+				c, c);
+		if (c == 0) {
+			paste_cancel();
+		} else if ((c >= 32 && c < 127) || c == 13) {
+			u16 wp = get_wp();
+			if (wp >= 0x8000 && wp < 0x8400) {
+				wp &= 0xff;
+				// R0 = charcode
+				fast_ram[wp>>1] = c << 8;
+				// R6 = status byte
+				fast_ram[(wp>>1)+6] = /*fast_ram[0x7c>>1]|*/0x2000;
+			} else {
+				// TODO handle workspace in expansion ram
+			}
+		}
 	}
-
 }
 
-
-#ifndef USE_SDL
-void vdp_init(void)
+void paste_text(char *text, int old_fps)
 {
+	// Set up a breakpoint in KSCAN to inject keys
+	set_breakpoint(paste_kscan_address, -1, BREAKPOINT_PASTE);
+
+	paste_str = my_strdup(text);
+	paste_idx = 0;
+	paste_old_fps = old_fps;
+	//printf("pasting %s\n", paste_str);
+	vdp_set_fps(0); // max speed
 }
 
-void vdp_done(void)
-{
-}
-
-int vdp_update(void)
-{
-	static int frames = 0;
-	if (frames == 82 || frames == 112) {
-		set_key(12, 1);
-		//print_name_table(vdp.reg, vdp.ram);
-
-	} else if (frames == 88 || frames == 116) {
-		set_key(12, 0);
-	}
-	frames++;
-	return frames >= 600;
-}
-
-#define unused __attribute__((unused))
-
-void vdp_line(unsigned int y, u8* restrict reg, u8* restrict ram)
-{
-}
-
-void vdp_text_pat(unused unsigned char *pat)
-{
-}
-
-void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight_line)
-{
-}
-
-void vdp_set_fps(int mfps /* fps*1000 */)
-{
-}
-
-void mute(int en)
-{
-}
-#endif
 
 
-#if 0
 /****************************************
  * Debugger interface functions         *
  ****************************************/
+
+#if 0
 
 struct breakpoint {
 	struct breakpoint *next; // linked list
@@ -954,76 +1573,66 @@ struct breakpoint {
 	u16 mask;  // used with CMP types
 	u16 value; // used with CMP types
 };
-
-static struct breakpoint* breakpoint_list = NULL;
-
-static int debugging = 0;
-
-static u16 check_break_func(u16 address)
-{
-	if (!debugging) {
-		struct breakpoint *bp = breakpoint_list;
-		debugging = 1;
-		while (bp) {
-			if (bp->address <= address && address <= bp->address_end && bp->type == BREAKPOINT) {
-				int i;
-				for (i = 0; i < 10; i++) {
-					disasm(get_pc());
-					single_step();
-					//print_regs();
-				}
-				
-				address = get_pc(); // important after single stepping, need to return opcode at pc
-				break;
-			}
-			bp = bp->next;
-		}
-		debugging = 0;
-	}
-	return safe_r(address);
-}
-
-
-
-void add_breakpoint(int type, u16 address, u16 address_end, u16 mask, u16 value)
-{
-	struct breakpoint *bp;
-
-	bp = safe_alloc(sizeof(*bp));
-	bp->next = breakpoint_list;
-	bp->type = type;
-	bp->address = address;
-	bp->address_end = address_end ?: address;
-	bp->mask = mask ?: 0xffff;
-	bp->value = value;
-
-	//if (type == BREAKPOINT) {
-		//iaq_func = check_break_func;
-	//}
-
-	breakpoint_list = bp;
-}
 #endif
 
-static int breakpoint_address = -1;
-static int breakpoint_bank = -1;
+static struct {
+	int address;
+	int bank;
+	int enabled;
+} *breakpoint;
+static int breakpoint_count = 0;
+static int breakpoint_skip_address = -1; // for resuming after a breakpoint, or single-stepping
+
 
 
 int breakpoint_read(u16 address) // called from brk_r() before read
 {
-	// TODO scan list of breakpoints to see if one is hit
+	int i;
 
-	// don't break if single-stepping!
-	if (address != breakpoint_address || debug_break == 2 || debug_en == 0)
-		return 0;
-	//printf("%s: address=%04X bp_bank=%d cart_bank=%d\n", __func__,
-	//	address, breakpoint_bank, cart_bank);
-	if (address >= 0x6000 && address < 0x8000) {
-		if (breakpoint_bank != -1 && breakpoint_bank != cart_bank)
+	//printf("breakpoint address=%04X skip=%d debug_en=%d\n", address,
+	//		breakpoint_skip_address, debug_en);
+	if (breakpoint_skip_address != -1) {
+		if (breakpoint_skip_address == address) {
+			breakpoint_skip_address = -1;
 			return 0;
+		}
+		breakpoint_skip_address = -1;
+	}
+	// don't break if single-stepping!
+	if (debug_break >= DEBUG_SINGLE_STEP) {
+		return 0;
 	}
 
-	return 1;
+	// scan list of breakpoints to see if one is hit
+	for (i = 0; i < breakpoint_count; i++) {
+		if (address != breakpoint[i].address)
+			continue;
+
+		if (address >= 0x6000 && address < 0x8000 &&
+		    breakpoint[i].bank != -1 && breakpoint[i].bank != cart_bank)
+			continue; // wrong bank
+		if (!breakpoint[i].enabled)
+			continue; // not enabled
+
+		if (breakpoint[i].enabled == BREAKPOINT_PASTE) {
+			paste_char();
+			return 0;
+		}
+
+		if (debug_en == 0)
+			continue; // debugger not open, but could paste instead
+
+		// breakpoint hit
+		debug_break = DEBUG_STOP;
+
+		// skip it next time when the debugger resumes execution
+		// FIXME what if the PC is changed before resuming
+		breakpoint_skip_address = address;
+
+		return 1; // memory read should return a BREAK opcode
+	}
+	//printf("didn't find a breakpoint for %04x bank %d\n", address, cart_bank);
+	return 0;
 }
 
 int breakpoint_write(u16 address) // called from brk_w() after write
@@ -1033,18 +1642,68 @@ int breakpoint_write(u16 address) // called from brk_w() after write
 	return 0;
 }
 
-void toggle_breakpoint(u16 address, int bank)
+int breakpoint_index(u16 address, int bank)
 {
-	if (breakpoint_address != address) {
-		breakpoint_address = address;
-		breakpoint_bank = bank;
-		clear_all_breakpoints();
-		set_breakpoint(address, 2/*bytes*/);
+	int i;
+	for (i = 0; i < breakpoint_count; i++) {
+		if (breakpoint[i].address == address) {
+			if (bank == -1 || bank == breakpoint[i].bank == bank) {
+				return i;
+			}
+		}
+	}
+	return -1;
+}
+
+void remove_breakpoint(u16 address, int bank)
+{
+	int i = breakpoint_index(address, bank);
+	if (i == -1) return;
+	memmove(&breakpoint[i], &breakpoint[i+1], sizeof(*breakpoint)*(breakpoint_count-i));
+	breakpoint_count--;
+	// TODO could shrink breakpoint array
+}
+
+// set or toggle breakpoint, enable=-1 to toggle, otherwise set to enable
+void set_breakpoint(u16 address, int bank, int enable)
+{
+	int i = breakpoint_index(address, bank);
+	if (i == -1) {
+		// create a new breakpoint
+		i = breakpoint_count++;
+		breakpoint = realloc(breakpoint, sizeof(*breakpoint) * breakpoint_count);
+		breakpoint[i].address = address;
+		breakpoint[i].bank = bank;
+		breakpoint[i].enabled = enable == BREAKPOINT_TOGGLE ? 1 : enable;
 	} else {
-		breakpoint_address = -1;
-		clear_all_breakpoints();
+		breakpoint[i].enabled = enable == BREAKPOINT_TOGGLE ? !breakpoint[i].enabled : enable;
+	}
+	//printf("i=%d address=%x bank=%d enabled=%d\n", i, breakpoint[i].address, breakpoint[i].bank, breakpoint[i].enabled);
+	cpu_reset_breakpoints();
+	for (i = 0; i < breakpoint_count; i++) {
+		if (breakpoint[i].enabled)
+			cpu_set_breakpoint(breakpoint[i].address, 2/*bytes*/);
 	}
 }
+
+int enum_breakpoint(int index, int *address, int *bank, int *enabled)
+{
+	if (index >= 0 && index < breakpoint_count) {
+		*address = breakpoint[index].address;
+		*bank = breakpoint[index].bank;
+		*enabled = breakpoint[index].enabled;
+		return 1;
+	}
+	return 0;
+}
+
+int get_breakpoint(int address, int bank)
+{
+	int i = breakpoint_index(address, bank);
+	if (i == -1) return -1;
+	return breakpoint[i].enabled;
+}
+
 
 
 
@@ -1057,6 +1716,7 @@ void set_cart_name(char *name)
 	cartridge_name = name;
 }
 
+// for ui.c:listing_search() in the debugger
 int get_cart_bank(void)
 {
 	return cart_bank;
@@ -1073,7 +1733,8 @@ void reset(void)
 	vdp.a = 0;
 	vdp.y = 0;
 
-	debug_log("initial WP=%04X PC=%04X ST=%04X\n", get_wp(), get_pc(), get_st());
+	printf("initial PC=%04X WP=%04X ST=%04X\n", get_pc(), get_wp(), get_st());
+	//debug_log("initial WP=%04X PC=%04X ST=%04X\n", get_wp(), get_pc(), get_st());
 
  	ga = 0xb5b5; // grom address
 	grom_last = 0xaf;
@@ -1091,14 +1752,18 @@ void reset(void)
 		cart_grom_size = 0;
 
 		// optionally load ROM
-		if (load_rom(cartridge_name, &cart_rom, &cart_rom_size, 0) == 0) {
-			// loaded success, try d rom
+		if (load_rom(cartridge_name, &cart_rom, &cart_rom_size) == 0) {
+			// loaded success, try D rom
 			if (tolower(cartridge_name[len-5]) == 'c' && cart_rom_size == 8192) {
 				char *name = malloc(len + 1);
 				memcpy(name, cartridge_name, len + 1);
 				// if '*c.bin' TODO check for '*d.bin'
 				name[len-5]++; // C to D
-				load_rom(name, &cart_rom, &cart_rom_size, 8192);
+				cart_rom = realloc(cart_rom, 16384);
+				cart_rom += 8192/2;
+				load_rom(name, &cart_rom, &cart_rom_size);
+				cart_rom -= 8192/2;
+				cart_rom_size += 16384;
 				free(name);
 			}
 		}
@@ -1106,8 +1771,8 @@ void reset(void)
 		if (cart_rom) {
 			unsigned int banks = (cart_rom_size + 0x1fff) >> 13;
 
-			cart_bank_mask = banks ? (1 << (32-__builtin_clz(banks))) - 1 : 0;
-			if (0)printf("cart_bank_mask = 0x%x  (size=%d banks=%d) page_size=%d\n",
+			cart_bank_mask = banks ? (1 << (31-__builtin_clz(banks))) - 1 : 0;
+			printf("cart_bank_mask = 0x%x  (size=%d banks=%d) page_size=%d\n",
 				cart_bank_mask, cart_rom_size, banks, 256/*1<<MAP_SHIFT*/);
 			set_cart_bank(0);
 		}
@@ -1133,6 +1798,7 @@ void reset(void)
 			free(name);
 			printf("grom=%p size=%u\n", cart_grom, cart_grom_size);
 		}
+#ifndef TEST
 		// optionally load listing
 		{
 			char *name = malloc(len + 1);
@@ -1145,15 +1811,7 @@ void reset(void)
 			load_listing(name, -1);
 			free(name);
 		}
-	}
-}
-
-
-void redraw_vdp(void)
-{
-	int y;
-	for (y = 0; y < 240; y++) {
-		vdp_line(y, vdp.reg, vdp.ram);
+#endif
 	}
 }
 
@@ -1162,15 +1820,16 @@ int vdp_update_or_menu(void)
 {
 	if (vdp_update() != 0)
 		return -1; // quitting
+#ifndef TEST
 	if (keyboard_down[0] & (1 << TI_MENU)) {
-		memset(&keyboard_down, 0, sizeof(keyboard_down)); // clear keys
+		reset_keys();
 		mute(1);
 		if (main_menu() == -1)
 			return -1; // quitting
-		if (!debug_break)
+		if (debug_break == DEBUG_RUN)
 			mute(0);
 	}
-
+#endif
 	return 0;
 }
 
@@ -1182,7 +1841,7 @@ void update_debug_window(void)
 
 	pc = get_pc();
 	wp = get_wp();
-	//memset(asm_text, 0, sizeof(asm_text));
+	memset(asm_text, 0, sizeof(asm_text));
 	disasm(pc);
 
 	if(0) {sprintf((char*)reg,
@@ -1259,12 +1918,12 @@ void update_debug_window(void)
 		asm_text, disasm_cyc);
 		vdp_text_window(reg, 26,30, 0,240, -1);
 
-
+		// show fast ram state
 		int i, n = 0;
-		for (i = 0x8300; i < 0x8400; i+= 16) {
+		for (i = 0; i < 128; i+=8) {
 			n += sprintf(reg+n, "  %04X:  %04X %04X %04X %04X  %04X %04X %04X %04X\n",
-				i, safe_r(i), safe_r(i+2), safe_r(i+4), safe_r(i+6), 
-				safe_r(i+8), safe_r(i+10), safe_r(i+12), safe_r(i+14));
+				0x8300+i*2, fast_ram[i], fast_ram[i+1], fast_ram[i+2], fast_ram[i+3],
+				fast_ram[i+4], fast_ram[i+5], fast_ram[i+6], fast_ram[i+7]);
 		}
 		reg[n] = 0;
 		vdp_text_window(reg, 53,30, 322,0, -1);
@@ -1298,7 +1957,6 @@ int main(int argc, char *argv[])
 	//if (!log) log = stderr;
 	//if (!log) log = fopen("NUL","w");
 
-
 	mem_init();
 
 	disasmf = log;
@@ -1314,10 +1972,12 @@ int main(int argc, char *argv[])
 	}
 
 	rom_size = 8192;
-	load_rom("994arom.bin", &rom, &rom_size, 0);
+	load_rom("994arom.bin", &rom, &rom_size);
 	grom_size = 24576;
 	load_grom("994agrom.bin", &grom, &grom_size);
+#ifndef TEST
 	load_listing("994arom.lst", -1);
+#endif
 	if (!rom || !grom) {
 		fprintf(stderr, "Failed to load ROM/GROM files: %s %s\n",
 			rom ? "" : "994arom.bin",
@@ -1329,44 +1989,44 @@ int main(int argc, char *argv[])
 	vdp_text_pat(grom + 0x06B4 - 32*7);
 
 	if (argc > 1) {
-		set_cart_name(
-#ifdef _WIN32
-				_strdup
-#else
-				strdup
-#endif
-				(argv[1])); // will get loaded on reset
-		//load_rom(argv[1], &cart_rom, &cart_rom_size, 0);
+		set_cart_name(my_strdup(argv[1])); // will get loaded on reset
+		//load_rom(argv[1], &cart_rom, &cart_rom_size);
+		argv++;
 	} else {
-		//load_rom("../phantis/phantisc.bin", &cart_rom, &cart_rom_size, 0);
-		//load_rom("cputestc.bin", &cart_rom, &cart_rom_size, 0);
-		//load_rom("../wordit/wordit8.bin", &cart_rom, &cart_rom_size, 0);
+		//load_rom("../phantis/phantisc.bin", &cart_rom, &cart_rom_size);
+		//load_rom("cputestc.bin", &cart_rom, &cart_rom_size);
+		//load_rom("../wordit/wordit8.bin", &cart_rom, &cart_rom_size);
 #ifdef TEST
-		//load_rom("cputestc.bin", &cart_rom, &cart_rom_size, 0);
-		//load_rom("test/mbtest.bin", &cart_rom, &cart_rom_size, 0);
-		load_rom("mbtest.bin", &cart_rom, &cart_rom_size, 0);
+		//load_rom("cputestc.bin", &cart_rom, &cart_rom_size);
+		//load_rom("test/mbtest.bin", &cart_rom, &cart_rom_size);
+		load_rom("mbtest.bin", &cart_rom, &cart_rom_size);
 #endif
 	}
 
 	vdp_init();
 
 	reset();
-	printf("initial PC=%04X WP=%04X ST=%04X\n", get_pc(), get_wp(), get_st());
 
 	//add_breakpoint(BREAKPOINT, 0x3aa, 0, 0, 0);
-#ifndef TEST
-	//debug_en = 1; debug_break = 1;
+#ifdef TEST
+	//debug_en = 1; debug_break = DEBUG_STOP;
+	test_argv = argv;
+	test_argc = argc;
 #endif
 
 #ifndef TEST
 	//load_listing("romsrc/ROM-4A.lst", 0);
 	//load_listing("../bnp/bnp.lst", 0);
 	//load_listing("fcmd/FCMD.listing", 0);
+
 #endif
 
+#ifdef ENABLE_GIF
+	GifBegin(&gif, "bulwip.gif", /*width*/320, /*height*/240, /*delay*/2, /*bitDepth*/4, /*dither*/false);
+#endif
 	int lines_per_frame = 262; // NTSC=262 PAL=313
 
-	while (vdp_update_or_menu() == 0) {
+	do {
 		if (debug_en) {
 			if (debug_window() == -1) break;
 		}
@@ -1387,16 +2047,23 @@ int main(int argc, char *argv[])
 
 			total_cycles += CYCLES_PER_LINE;
 			add_cyc(-CYCLES_PER_LINE);
-			if (debug_break == 2) {
+			if (debug_break == DEBUG_SINGLE_STEP) {
 				single_step();
-				debug_break = 1;
+				debug_break = DEBUG_STOP;
 				break;
 			}
 			emu(); // emulate until cycle counter goes positive
+			// a breakpoint will change debug_break variable
 
-		} while (vdp.y != 0 && debug_break == 0);
-	}
+		} while (vdp.y != 0 && (debug_break == DEBUG_RUN || debug_break == DEBUG_FRAME_STEP));
+#ifdef ENABLE_GIF
+		GifWriteFrame(&gif, (u8*)frame_buffer, /*width*/320, /*height*/240, /*delay*/2, /*bitDepth*/4, /*dither*/false);
+#endif
+	} while (vdp_update_or_menu() == 0);
 
+#ifdef ENABLE_GIF
+	GifEnd(&gif);
+#endif
 	//debug_log("%d\n", total_cycles);
 	vdp_done();
 #ifdef TEST

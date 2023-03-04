@@ -26,7 +26,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #define _GNU_SOURCE 1
-#define _POSIX_C_SOURCE 1
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -40,6 +39,32 @@ static u16 gPC, gWP; // st is below with status functions
 static int cyc = 0; // cycle counter (cpu runs until > 0)
 static int interrupt_level = 0; // interrupt level + 1  (call interrupt_check() after modifying)
 static int breakpoint_saved_cyc = 0;
+static struct {
+	u16 pc, op, ts, td, cyc;
+} trace[1024], *tracer = trace;
+
+
+enum {
+	TRACE_PC,
+	TRACE_ST,
+	TRACE_WP,
+	TRACE_MEMR,
+	TRACE_MEMW,
+	TRACE_CRUR,
+	TRACE_CRUW,
+};
+
+u8 trace_what[100];
+u16 trace_addr[100];
+u16 trace_data[100];
+int trace_offset = 0;
+
+static void trace_it(u8 what, u16 addr, u16 data)
+{
+	trace_what[trace_offset] = what;
+	trace_addr[trace_offset] = addr;
+	trace_data[trace_offset++] = data;
+}
 
 u16 get_pc(void) { return gPC; }
 u16 get_wp(void) { return gWP; }
@@ -166,6 +191,7 @@ void set_mapping(int base, int size,
 static always_inline u16 mem_r(u16 address)
 {
 	u16 value = map_read(address >> MAP_SHIFT)(address);
+	//trace_it(TRACE_MEMR, address, value);
 	return value;
 }
 
@@ -179,6 +205,7 @@ u16 safe_r(u16 address)
 
 static always_inline void mem_w(u16 address, u16 value)
 {
+	//trace_it(TRACE_MEMW, address, value);
 	map_write(address >> MAP_SHIFT)(address, value);
 }
 
@@ -259,7 +286,7 @@ static void brk_w(u16 address, u16 value)
 }
 
 
-void clear_all_breakpoints(void)
+void cpu_reset_breakpoints(void)
 {
 	int i;
 	for (i = 0; i < PAGES_IN_64K; i++) {
@@ -268,7 +295,7 @@ void clear_all_breakpoints(void)
 	}
 }
 
-void set_breakpoint(u16 base, u16 size)
+void cpu_set_breakpoint(u16 base, u16 size)
 {
 	int i, end;
 	end = (base + size) >> MAP_SHIFT;
@@ -436,8 +463,13 @@ static always_inline u16 Ts(u16 op, u16 *pc, u16 wp)
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0
 		addr = reg_r(wp, reg);
-		val = mem_r(mem_r(*pc) + (reg ? addr : 0));
+		addr = (
+#ifdef ENABLE_TRACE
+			tracer->ts = 
+#endif
+			mem_r(*pc)) + (reg ? addr : 0);
 		*pc += 2;
+		val = mem_r(addr);
 		cyc += 4;
 		break;
 	case 3: // *Rx+
@@ -467,7 +499,11 @@ static always_inline u16 TsB(u16 op, u16 *pc, u16 wp)
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0  10c
 		addr = reg_r(wp, reg);
-		addr = mem_r(*pc) + (reg ? addr : 0);
+		addr = (
+#ifdef ENABLE_TRACE
+			tracer->ts = 
+#endif
+			mem_r(*pc)) + (reg ? addr : 0);
 		*pc += 2;
 		val = mem_r(addr);
 		cyc += 4;
@@ -503,7 +539,11 @@ static always_inline struct val_addr Td(u16 op, u16 *pc, u16 wp)
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0  10c
 		va.addr = reg_r(wp, reg);
-		va.addr = mem_r(*pc) + (reg ? va.addr : 0);
+		va.addr = (
+#ifdef ENABLE_TRACE
+			tracer->td = 
+#endif
+			mem_r(*pc)) + (reg ? va.addr : 0);
 		*pc += 2;
 		va.val = mem_r(va.addr);
 		cyc += 4;
@@ -534,7 +574,11 @@ static always_inline struct val_addr TdB(u16 op, u16 *pc, u16 wp)
 		cyc += 2;
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0
-		va.addr = mem_r(*pc) + (reg ? va.addr : 0);
+		va.addr = (
+#ifdef ENABLE_TRACE
+			tracer->td = 
+#endif
+			mem_r(*pc)) + (reg ? va.addr : 0);
 		*pc += 2;
 		va.val = mem_r(va.addr);
 		cyc += 4;
@@ -632,6 +676,7 @@ static const struct {
 #define L8(a,b,c,d,e,f,g,h) L4(a,b,c,d),L4(e,f,g,h)
 
 int disasm(u16 pc); // forward
+int disasm_cyc = 0; // actual number of cycles for disassembly
 
 
 // idea for faster indirect memory read/write
@@ -649,21 +694,58 @@ int disasm(u16 pc); // forward
 void emu(void)
 {
 	u16 op, pc = gPC, wp = gWP;
+#ifdef LOG_DISASM
+	int start_cyc;
+#endif
+#ifdef ENABLE_TRACE
+	int tracer_cyc;
+#endif
+
+	goto start_decoding;
 decode_op:
+#ifdef LOG_DISASM
+	disasm_cyc = cyc - start_cyc;
+	disasm(gPC);
+#endif
+#ifdef ENABLE_TRACE
+	tracer->cyc = cyc - tracer_cyc;
+	tracer++;
+	if (tracer == trace + ARRAY_SIZE(trace))
+		tracer = trace;
+#endif
 	// when cycle counter rolls positive, go out and render a scanline
 	if (cyc > 0)
 		goto done;
+	goto start_decoding;
 
 decode_op_now: // this is used by instructions which cannot be interrupted (XOP, BLWP)
-
+#ifdef LOG_DISASM
+	disasm_cyc = cyc - start_cyc;
+	disasm(gPC);
+#endif
+#ifdef ENABLE_TRACE
+	tracer->cyc = cyc - tracer_cyc;
+	tracer++;
+	if (tracer == trace + ARRAY_SIZE(trace))
+		tracer = trace;
+#endif
+start_decoding:
+	gPC = pc;  // breakpoints will need to know the current PC
 	if (0/*trace*/) {
 		int save_cyc = cyc;
+		gWP = wp;
 		disasm(pc);
 		cyc = save_cyc;
 	}
-	gPC = pc;  // breakpoints will need to know the current PC
-
+#ifdef LOG_DISASM
+	start_cyc = cyc;
+#endif
 	op = mem_r(pc);
+#ifdef ENABLE_TRACE
+	tracer->pc = pc;
+	tracer->op = op;
+	tracer_cyc = cyc;
+#endif
 	// if this mem read triggers a breakpoint, it will save the cycles
 	// before reading the memory and will return C99_BRK
 	pc += 2;
@@ -707,6 +789,7 @@ execute_op:
 				} else {
 					status_arith(status_parity(ts), td.val & 0xff00);
 				}
+				Td_post_increment(op, wp, td, 1);
 				goto decode_op;
 			case 5: // AB
 				if (td.addr & 1) {
@@ -1033,6 +1116,13 @@ decode_op_now:
 		disasm(pc);
 		cyc = save_cyc;
 	}
+
+
+	//trace_offset = 0;
+	//trace_it(TRACE_PC, pc, 0);
+	//trace_it(TRACE_ST, get_st(), 0);
+	//trace_it(TRACE_WP, wp, 0);
+
 	op = mem_r(pc);
 	pc += 2;
 execute_op:
@@ -1418,7 +1508,7 @@ static u16 disasm_Ts(u16 pc, u16 op, int opsize)
 		break;
 	case 1: // *Rx
 		print_asm("*R%d", i);
-		sprintf(disbuf+strlen(disbuf), " *R%d=%04X", i, safe_r(safe_r(gWP+i*2)));
+		sprintf(disbuf+strlen(disbuf), " *(R%d=%04X)=%04X ", i, safe_r(gWP+i*2), safe_r(safe_r(gWP+i*2)));
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0
 		pc += 2;
@@ -1432,7 +1522,9 @@ static u16 disasm_Ts(u16 pc, u16 op, int opsize)
 		break;
 	case 3: // *Rx+
 		print_asm("*R%d+", i);
-		sprintf(disbuf+strlen(disbuf), " *R%d=%04X", i, safe_r(safe_r(gWP+(op&15)*2)-opsize));
+		sprintf(disbuf+strlen(disbuf), " *(R%d=%04X)+=%04X", i,
+			safe_r(gWP+(op&15)*2) /*-opsize*/,    // subtracting opsize will undo the increment
+			safe_r(safe_r(gWP+(op&15)*2)/*-opsize*/)); // but only if disassembling after executing
 		break;
 	}
 	return pc;
@@ -1468,7 +1560,6 @@ static u16 disasm_Bs(u16 pc, u16 op, int opsize)
 	return pc;
 }
 
-int disasm_cyc = 0; // estimated number of cycles during disassembly
 
 // returns number of bytes in the disassembled instruction (2, 4, or 6)
 int disasm(u16 pc)
@@ -1565,13 +1656,14 @@ LWPI: LIMI:
 	goto done;
 
 done:
-	print_asm("\n");
+	//print_asm("\n");
+	//print_asm("\t\t%s\n", disbuf);
+	print_asm("\t\t(%d)\n", disasm_cyc);
 	int ret = pc - start_pc;
 	while (start_pc != pc) {
 		start_pc += 2;
-		print_asm("%04X  %04X\n", start_pc, safe_r(start_pc));
+		print_asm("      %04X\n", safe_r(start_pc));
 	}
-	print_asm("     %s\n", disbuf);
 	cyc = save_cyc;
 	return ret;
 }

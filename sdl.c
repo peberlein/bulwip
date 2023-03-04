@@ -33,7 +33,7 @@
 #include "player.h"
 
 
-#define ENABLE_CRT
+// enabled in Makefile
 #ifdef ENABLE_CRT
 //#include "NTSC-CRT-v2/crt_core.h"
 #include "NTSC-CRT/crt.h"
@@ -61,357 +61,42 @@ static void my_audio_callback(void *userdata, Uint8 *stream, int len)
 		// For AUDIO_U8, len is number of samples to generate
 		update(stream, 0, len);
 	}
-	if (0)printf("%02x %02x %02x %02x %02x %02x %02x %02x\n",
-		stream[0],stream[1],stream[2],stream[3],
-		stream[4],stream[5],stream[6],stream[7]);
 }
 
 
-
-
-// clamp number between 0.0 and 1.0
-#define CLAMP(x) ((x) < 0 ? 0 : (x) > 1 ? 1 : (x))
-// take values from 0.0 to 1.0
-#if 1
-// YUV to RGB for analog TV
-#define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.000*Y               +1.140*(Cb-0.5))*255)<<16) | \
-                          ((int)(CLAMP(1.000*Y-0.395*(Cr-0.5)-0.581*(Cb-0.5))*255)<<8)  | \
-			  ((int)(CLAMP(1.000*Y+2.032*(Cr-0.5)               )*255)))
-#elif 0
-// YCbCr to RGB for SDTV
-#define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.164*Y               +1.596*(Cb-0.5))*255)<<16) | \
-                          ((int)(CLAMP(1.164*Y-0.392*(Cr-0.5)-0.813*(Cb-0.5))*255)<<8)  | \
-			  ((int)(CLAMP(1.164*Y+2.017*(Cr-0.5)               )*255)))
-#elif 0
-// Full-range YCbCr to RGB for SDTV
-#define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.000*Y               +1.400*(Cb-0.5))*255)<<16) | \
-                          ((int)(CLAMP(1.000*Y-0.343*(Cr-0.5)-0.711*(Cb-0.5))*255)<<8)  | \
-			  ((int)(CLAMP(1.000*Y+1.765*(Cr-0.5)               )*255)))
-#endif
-
-static unsigned int palette[16] = {
-#if 0
-// http://atariage.com/forums/topic/238672-rgb-color-codes-for-ti-994a-colors/
-	0x000000, // transparent
-	0x000000, // black
-	0x46b83c, // medium green
-	0x7ccf70, // light green
-	0x5d4fff, // dark blue
-	0x7f71ff, // light blue
-	0xb66247, // dark red
-	0x5cc7ee, // cyan
-	0xd86b48, // medium red
-	0xfb8f6c, // light red
-	0xc3ce42, // dark yellow
-	0xd3db77, // light yellow
-	0x3ea030, // dark green
-	0xb664c6, // magenta
-	0xcdcdcd, // gray
-	0xffffff, // white
-#elif 0
-// TMS https://www.smspower.org/maxim/forumstuff/colours.html
-	0x000000, // transparent
-	0x000000, // black
-	0x47b73b, // medium green
-	0x7ccf6f, // light green
-	0x5d4eff, // dark blue
-	0x8072ff, // light blue
-	0xb66247, // dark red
-	0x5dc8ed, // cyan
-	0xd76b48, // medium red
-	0xfb8f6c, // light red
-	0xc3cd41, // dark yellow
-	0xd3da76, // light yellow
-	0x3e9f2f, // dark green
-	0xb664c7, // magenta
-	0xcccccc, // gray
-	0xffffff, // white
-#elif 0
-// SMS https://www.smspower.org/forums/post37531#37531
-	0x000000, // transparent
-	0x000000, // black
-	0x00aa00, // medium green
-	0x00ff00, // light green
-	0x000055, // dark blue
-	0x0000ff, // light blue
-	0x550000, // dark red
-	0x00ffff, // cyan
-	0xaa0000, // medium red
-	0xff0000, // light red
-	0x555500, // dark yellow
-	0xffff00, // light yellow
-	0x005500, // dark green
-	0xff00ff, // magenta
-	0x555555, // gray
-	0xffffff, // white
-#else
-// http://www.unige.ch/medecine/nouspikel/ti99/tms9918a.htm#Colors
-// taken from TMS9918A/TMS9928A/TMS9929A Video Display Processors TABLE 2-3 
-	0x000000, // transparent
-	YUV2RGB(0.00, 0.47, 0.47), // black
-	YUV2RGB(0.53, 0.07, 0.20), // medium green
-	YUV2RGB(0.67, 0.17, 0.27), // light green
-	YUV2RGB(0.40, 0.40, 1.00), // dark blue
-	YUV2RGB(0.53, 0.43, 0.93), // light blue
-	YUV2RGB(0.47, 0.83, 0.30), // dark red
-	YUV2RGB(0.67, 0.00, 0.70), // cyan   NOTE! 992X use Luma .73
-	YUV2RGB(0.53, 0.93, 0.27), // medium red
-	YUV2RGB(0.67, 0.93, 0.27), // light red
-	YUV2RGB(0.73, 0.57, 0.07), // dark yellow
-	YUV2RGB(0.80, 0.57, 0.17), // light yellow
-	YUV2RGB(0.47, 0.13, 0.23), // dark green
-	YUV2RGB(0.53, 0.73, 0.67), // magenta
-	YUV2RGB(0.80, 0.47, 0.47), // gray
-	YUV2RGB(1.00, 0.47, 0.47), // white
-#endif
-};
-
-
-
-#define TOPBORD 24
-#define BOTBORD 24
-#define LFTBORD 32
-#define RGTBORD 32
-#define SPRITES_PER_LINE 4
-#define EARLY_CLOCK_BIT 0x80
-#define FIFTH_SPRITE 0x40
-#define SPRITE_COINC 0x20
-
-static int config_sprites_per_line = SPRITES_PER_LINE;
+// This is the screen texture
+// Normally render 320x240, 80-col text mode 640x240, CRT mode 640x480
+static const int texture_width = 640, texture_height = 480;
 static SDL_Texture *texture = NULL;
+static int texture_len = 0; // will be 320 for normal, 640 for 80-col text mode
+#ifdef ENABLE_CRT
+static void *crt_src = NULL;
+static void *crt_dest = NULL;
+#endif
 
-void vdp_line(unsigned int line,
-		unsigned char* restrict reg,
-		unsigned char* restrict ram)
+// NOTE: pixels is write-only
+void vdp_lock_texture(int line, int len, void**pixels, int *pitch)
 {
-	SDL_Rect rect = {0, line, 320, 1};
-	uint32_t *pixels;
-	int pitch = 0;
-	uint32_t bg = palette[reg[7] & 0xf];
-	uint32_t fg = palette[(reg[7] >> 4) & 0xf];
-
-	palette[0] = palette[(reg[7] & 0xf) ?: 1];
-
+	texture_len = len; // determines the display width of the texture 
+#ifdef ENABLE_CRT
+	if (config_crt_filter == 2 && crt_src != NULL) {
+		*pixels = crt_src + texture_width * 4 * line;
+		*pitch = texture_width * 4;
+	} else
+#endif
 	if (texture) {
-		SDL_LockTexture(texture, &rect, (void**)&pixels, &pitch);
-	} else {
-		static uint32_t *dummy = NULL;
-		if (!dummy) dummy = malloc(320*240*sizeof(int));
-		pixels = dummy;
+		SDL_Rect rect = {0, line, len, 1};
+		SDL_LockTexture(texture, &rect, pixels, pitch);
 	}
+}
 
-	if (line < TOPBORD || line >= TOPBORD+192 || (reg[1] & 0x40) == 0) {
-		// draw border or blanking
-		for (int i = 0; i < LFTBORD+256+RGTBORD; i++) {
-			*pixels++ = bg;
-		}
-	} else {
-		unsigned int sy = line - TOPBORD; // screen y, adjusted for border
-		unsigned char *scr = ram + (reg[2] & 0xf) * 0x400;
-		unsigned char *col = ram + reg[3] * 0x40;
-		unsigned char *pat = ram + (reg[4] & 0x7) * 0x800 + (sy & 7);
-
-		// draw left border
-		for (int i = 0; i < LFTBORD; i++) {
-			*pixels++ = bg;
-		}
-
-		uint32_t *save_pixels = pixels;
-
-		// draw graphics
-		unsigned char mode = (reg[0] & 0x02) | (reg[1] & 0x18);
-
-		if (mode == 0x0) {
-			// mode 1 (standard)
-			scr += (sy / 8) * 32;
-
-			for (unsigned char i = 32; i; i--) {
-				unsigned char
-					ch = *scr++,
-					c = col[ch >> 3];
-				unsigned int
-					fg = palette[c >> 4],
-					bg = palette[c & 15];
-				ch = pat[ch * 8];
-				for (unsigned char j = 0x80; j; j >>= 1)
-					*pixels++ = ch & j ? fg : bg;
-			}
-		} else if (mode & 0x10) {
-			// text mode(s) 
-			scr += (sy / 8) * 40;
-			for (int i = 0; i < 8; i++) {
-				*pixels++ = bg;
-			}
-			if (mode == 0x10) {
-				for (unsigned char i = 40; i; i--) {
-					unsigned char ch = *scr++;
-					ch = pat[ch * 8];
-					for (unsigned char j = 0x80; j != 2; j >>= 1)
-						*pixels++ = ch & j ? fg : bg;
-				}
-			} else if (mode == 0x12) { // text bitmap
-				unsigned int patmask = ((reg[4]&3)<<11)|(0x7ff);
-				pat = ram + (reg[4] & 0x04) * 0x800 +
-					(((sy / 64) * 2048) & patmask) + (sy & 7);
-				for (unsigned char i = 40; i; i--) {
-					unsigned char ch = *scr++;
-					ch = pat[ch * 8];
-					for (unsigned char j = 0x80; j != 2; j >>= 1)
-						*pixels++ = ch & j ? fg : bg;
-				}
-			} else { // illegal mode (40 col, 4px fg, 2px bg)
-				for (unsigned char i = 40; i; i--) {
-					*pixels++ = fg;
-					*pixels++ = fg;
-					*pixels++ = fg;
-					*pixels++ = fg;
-					*pixels++ = bg;
-					*pixels++ = bg;
-				}
-			}
-			for (int i = 0; i < 8; i++) {
-				*pixels++ = bg;
-			}
-
-		} else if (mode == 0x02) {
-			// mode 2 (bitmap)
-
-			// masks for hybrid modes
-			unsigned int colmask = ((reg[3] & 0x7f) << 6) | 0x3f;
-			unsigned int patmask = ((reg[4] & 3) << 11) | (colmask & 0x7ff);
-
-			scr += (sy / 8) * 32;  // get row
-
-			col = ram + (reg[3] & 0x80) * 0x40 +
-				(((sy / 64) * 2048) & colmask) + (sy & 7);
-			pat = ram + (reg[4] & 0x04) * 0x800 +
-				(((sy / 64) * 2048) & patmask) + (sy & 7);
-
-			// TODO handle bitmap modes
-			for (unsigned char i = 32; i; i--) {
-				unsigned char
-					ch = *scr++,
-					c = col[(ch & patmask) * 8];
-				unsigned int
-					fg = palette[c >> 4],
-					bg = palette[c & 15];
-				ch = pat[(ch & colmask) * 8];
-				for (unsigned char j = 0x80; j; j >>= 1)
-					*pixels++ = ch & j ? fg : bg;
-			}
-		} else if (mode == 0x08) {
-			// multicolor 64x48 pixels
-			pat -= (sy & 7); // adjust y offset
-			pat += ((sy / 4) & 7);
-
-			scr += (sy / 8) * 32;  // get row
-
-			for (unsigned char i = 32; i; i--) {
-				unsigned char
-					ch = *scr++,
-					c = pat[ch * 8];
-				unsigned int
-					fg = palette[c >> 4],
-					bg = palette[c & 15];
-				for (unsigned char j = 0; j < 4; j++)
-					*pixels++ = fg;
-				for (unsigned char j = 0; j < 4; j++)
-					*pixels++ = bg;
-			}
-
-		}
-
-		// draw right border
-		for (int i = 0; i < RGTBORD; i++) {
-			*pixels++ = bg;
-		}
-		pixels = save_pixels;
-
-		// no sprites in text mode
-		if (!(reg[1] & 0x10)) {
-			unsigned char sp_size = (reg[1] & 2) ? 16 : 8;
-			unsigned char sp_mag = sp_size << (reg[1] & 1); // magnified sprite size
-			unsigned char *sl = ram + (reg[5] & 0x7f) * 0x80; // sprite list
-			unsigned char *sp = ram + (reg[6] & 0x7) * 0x800; // sprite pattern table
-			unsigned char coinc[256] = {0};
-
-			// draw sprites  (TODO limit 4 sprites per line, and higher priority sprites)
-			struct {
-				unsigned char *p;  // Sprite pattern data
-				unsigned char x;   // X-coordinate
-				unsigned char f;   // Color and early clock bit
-			} sprites[32]; // TODO Sprite limit hardcoded at 4
-			int sprite_count = 0;
-
-			for (unsigned char i = 0; i < 32; i++) {
-				unsigned int dy = sy;
-				unsigned char y = *sl++; // Y-coordinate minus 1
-				unsigned char x = *sl++; // X-coordinate
-				unsigned char s = *sl++; // Sprite pattern index
-				unsigned char f = *sl++; // Flags and color
-
-				if (y == 0xD0) // Sprite List terminator
-					break;
-				if (y > 0xD0)
-					dy += 256; // wraps around top of screen
-				if (y+1+sp_mag <= dy || y+1 > dy)
-					continue; // not visible
-				if (sp_size == 16)
-					s &= 0xfc; // mask sprite index
-
-				//if (f & 15)
-				//	printf("%d %x %d %d %d %02x %02x\n", sy, (reg[5]&0x7f)*0x80, sprite_count, y, x, s, f);
-				if (sprite_count == SPRITES_PER_LINE && (reg[8] & FIFTH_SPRITE) == 0) {
-					reg[8] &= 0xe0;
-					reg[8] |= FIFTH_SPRITE + i;
-				}
-				if (sprite_count >= config_sprites_per_line)
-					break;
-
-				sprites[sprite_count].p = sp + (s * 8) + (dy - (y+1));
-				sprites[sprite_count].x = x;
-				sprites[sprite_count].f = f;
-				sprite_count++;
-			}
-			// draw in reverse order so that lower sprite index are higher priority
-			while (sprite_count > 0) {
-				sprite_count--;
-				unsigned char *p = sprites[sprite_count].p; // pattern pointer
-				int x = sprites[sprite_count].x;
-				unsigned char f = sprites[sprite_count].f; // flags and color
-				unsigned int c = palette[f & 0xf];
-				unsigned int mask = (p[0] << 8) | p[16]; // bit mask of solid pixels
-				int count = sp_mag; // number of pixels to draw
-				int inc_mask = (reg[1] & 1) ? 1 : 0xff;
-
-
-				//printf("%d %d %d %04x\n", sprite_count, x, f, mask);
-				if (f & EARLY_CLOCK_BIT) {
-					x -= 32;
-					while (count > 0 && x < 0) {
-						if (count & inc_mask)
-							mask <<= 1;
-						++x;
-						count--;
-					}
-				}
-
-				while (count > 0) {
-					if (mask & 0x8000) {
-						if (f != 0)  // don't draw transparent color
-							pixels[x] = c;
-						reg[8] |= coinc[x];
-						coinc[x] = SPRITE_COINC;
-					}
-					if (count & inc_mask)
-						mask <<= 1;
-					if (++x >= 256)
-						break;
-					count--;
-				}
-			}
-		}
-	}
+void vdp_unlock_texture(void)
+{
+#ifdef ENABLE_CRT
+	if (config_crt_filter == 2 && crt_src != NULL) {
+		// nothing to do, but don't unlock texture we haven't locked
+	} else
+#endif
 	if (texture) {
 		SDL_UnlockTexture(texture);
 	}
@@ -427,25 +112,39 @@ void vdp_text_pat(unsigned char *pat)
 
 static SDL_Texture *debug_texture = NULL;
 
+extern unsigned int palette[16]; // bulwip.c
+
+#define AMSK 0xff000000
+#define RMSK 0x00ff0000
+#define GMSK 0x0000ff00
+#define BMSK 0x000000ff
+
+
 void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight_line)
 {
 	char fg_color = 1; //15;
 	char bg_color = 14; //4;
-	uint32_t bg = palette[highlight_line == 0 ? fg_color : bg_color] | 0xff000000;
-	uint32_t fg = palette[highlight_line == 0 ? bg_color : fg_color] | 0xff000000;
+	uint32_t bg = palette[highlight_line == 0 ? fg_color : bg_color] | AMSK;
+	uint32_t fg = palette[highlight_line == 0 ? bg_color : fg_color] | AMSK;
 	uint32_t *pixels;
 	int pitch = 0;
 	const char *start = line;
+	struct SDL_Rect rect = {
+		.x = x,
+		.y = y,
+		.w = w * 6,
+		.h = h * 8,
+	};
 
 	if (!debug_texture) return;
-	SDL_LockTexture(debug_texture, NULL, (void**)&pixels, &pitch);
+	SDL_LockTexture(debug_texture, &rect, (void**)&pixels, &pitch);
 
-	pixels += x + y * (pitch/4);
+	//pixels += x + y * (pitch/4);
 	for (unsigned int j = 0; j < h*8; j++) {
 		if ((j&7) == 7) {
 			if (j/8 == highlight_line-1) {
-				bg = palette[fg_color] | 0xff000000;  // inverted
-				fg = palette[bg_color] | 0xff000000;
+				bg = palette[fg_color] | AMSK;  // inverted
+				fg = palette[bg_color] | AMSK;
 			}
 #if 0
 			for (unsigned int i = 0; i < w*6; i++)
@@ -456,8 +155,8 @@ void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight
 			pixels += (pitch/4) - (w*6);
 
 			if (j/8 == highlight_line) {
-				bg = palette[bg_color] | 0xff000000;  // normal
-				fg = palette[fg_color] | 0xff000000;
+				bg = palette[bg_color] | AMSK;  // normal
+				fg = palette[fg_color] | AMSK;
 			}
 			continue;
 #endif
@@ -475,9 +174,9 @@ void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight
 			if (ch >= 'a' && ch <= 'z') {
 				static const u8 lowercase[] = {
 					0x00,0x38,0x04,0x3C,0x44,0x4C,0x34,0x00, // a
-					0x40,0x78,0x44,0x44,0x44,0x44,0x78,0x00, // b
+					0x40,0x58,0x64,0x44,0x44,0x44,0x78,0x00, // b
 					0x00,0x38,0x44,0x40,0x40,0x44,0x38,0x00, // c
-					0x04,0x3C,0x44,0x44,0x44,0x44,0x3C,0x00, // d
+					0x04,0x34,0x4c,0x44,0x44,0x44,0x3C,0x00, // d
 					0x00,0x38,0x44,0x7C,0x40,0x44,0x38,0x00, // e
 					0x18,0x24,0x20,0x78,0x20,0x20,0x20,0x00, // f
 					0x00,0x38,0x44,0x44,0x44,0x3C,0x44,0x38, // g
@@ -528,8 +227,8 @@ void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight
 			start = line;
 			text_pat -= 8;
 			if (j/8 == highlight_line) {
-				bg = palette[bg_color] | 0xff000000;  // normal
-				fg = palette[fg_color] | 0xff000000;
+				bg = palette[bg_color] | AMSK;  // normal
+				fg = palette[fg_color] | AMSK;
 			}
 		}
 	}
@@ -539,27 +238,68 @@ void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight
 void vdp_text_clear(int x, int y, int w, int h, unsigned int color)
 {
 	SDL_Surface *surface;
-	int pitch = 0;
 	struct SDL_Rect rect = {
 		.x = x,
 		.y = y,
 		.w = w * 6,
 		.h = h * 8,
 	};
+	void *pixels;
+	int pitch;
 
 	if (!debug_texture) return;
-	SDL_LockTextureToSurface(debug_texture, &rect, &surface);
-	SDL_FillRect(surface, NULL, color);
+	//SDL_LockTextureToSurface(debug_texture, &rect, &surface); // requires SDL 2.0.12
+	SDL_LockTexture(debug_texture, &rect, &pixels, &pitch);
+	surface = SDL_CreateRGBSurfaceFrom(pixels, rect.w, rect.h, 32, pitch, RMSK, GMSK, BMSK, AMSK);
+	if (surface) {
+		SDL_FillRect(surface, NULL, color);
+		SDL_FreeSurface(surface);
+	}
 	SDL_UnlockTexture(debug_texture);
 }
 
+void vdp_draw_graph(double *array)
+{
+	SDL_Surface *surface;
+	int i, pk = -1;
+	unsigned int color;
+	void *pixels;
+	int pitch;
+
+	if (!debug_texture) return;
+	//SDL_LockTextureToSurface(debug_texture, NULL, &surface); // requires SDL 2.0.12
+	SDL_LockTexture(debug_texture, NULL, &pixels, &pitch);
+	surface = SDL_CreateRGBSurfaceFrom(pixels, 640, 480, 32, pitch, RMSK, GMSK, BMSK, AMSK);
+	if (surface) {
+		SDL_FillRect(surface, NULL, AMSK);
+		for (i = 0; i < 640; i++) {
+			int n = (int)(array[i]*20);
+			struct SDL_Rect rect = {
+				.x = i,
+				.y = 480-n,
+				.w = 1,
+				.h = n,
+			};
+			unsigned int color = 0xffffffff;
+			if (pk == -1 && array[i] > array[i+1]) {
+				color = AMSK | RMSK;
+				pk = i;
+			} else if (pk != -1 && array[i] < array[i+1]) {
+				color = AMSK | GMSK;
+				pk = -1;
+			}
+			SDL_FillRect(surface, &rect, color);
+		}
+		SDL_FreeSurface(surface);
+	}
+	SDL_UnlockTexture(debug_texture);
+}
 
 
 static SDL_Window *window = NULL;
 static SDL_Renderer *renderer = NULL;
 #ifdef ENABLE_CRT
 static struct CRT crt;
-static SDL_Texture *crt_texture = NULL;
 #define CRT_W ((640)*1)
 #define CRT_H ((480)*1)
 #endif
@@ -567,12 +307,14 @@ static SDL_Texture *crt_texture = NULL;
 static Uint64 ticks_per_frame = 0; // actually ticks per frame << 32
 static int first_tick = 0;
 static unsigned int frames = 0;
-static unsigned int scale_w = 640, scale_h = 480;
+static unsigned int scale_w = 640, scale_h = 480; // window size
 static unsigned int config_fullscreen = 0;
 int menu_active = 0;
+int current_mfps = 0;
 
 void vdp_set_fps(int mfps /* fps*1000 */)
 {
+	current_mfps = mfps;
 	if (mfps == 0) {
 		ticks_per_frame = 0; // uncapped framerate
 	} else {
@@ -598,7 +340,9 @@ void vdp_set_filter(void)
 		SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
 	}
 	texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
-			SDL_TEXTUREACCESS_STREAMING, 320, 240);
+			SDL_TEXTUREACCESS_STREAMING, texture_width, texture_height);
+
+	redraw_vdp(); // redraw the screen texture
 }
 
 void vdp_init(void)
@@ -644,17 +388,9 @@ void vdp_init(void)
 				SDL_TEXTUREACCESS_STREAMING, 640, 480);
 		SDL_SetTextureBlendMode(debug_texture, SDL_BLENDMODE_BLEND);
 #ifdef ENABLE_CRT
-		{
-			SDL_Rect rect = {0, 0, CRT_W, CRT_H+50};
-			void *pixels;
-			int pitch = 0;
-			crt_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
-				SDL_TEXTUREACCESS_STREAMING, rect.w, rect.h);
-
-			SDL_LockTexture(crt_texture, &rect, &pixels, &pitch);
-			crt_init(&crt, rect.w, rect.h, pixels);
-			SDL_UnlockTexture(crt_texture);
-		}
+		crt_src = calloc(texture_width * 240, 4);
+		crt_dest = calloc(CRT_W * CRT_H, 4);
+		crt_init(&crt, CRT_W, CRT_H, crt_dest);
 #endif
 	}
 
@@ -668,7 +404,7 @@ void vdp_init(void)
 	first_tick = SDL_GetTicks();
 
 	vdp_set_fps(NTSC_FPS);
-	vdp_text_clear(0, 0, 640/6+1, 480/8, 0xff000000); // clear debug window
+	vdp_text_clear(0, 0, 640/6+1, 480/8, AMSK); // clear debug window
 
 	if (window) {
 		SDL_PauseAudio(0); // start playing
@@ -678,28 +414,31 @@ void vdp_init(void)
 
 void vdp_done(void)
 {
+	fprintf(stderr, "SDL_QUIT %f fps\n", frames*1000.0/(SDL_GetTicks()-first_tick));
 	if (texture) SDL_DestroyTexture(texture);
 #ifdef ENABLE_CRT
-	if (crt_texture) SDL_DestroyTexture(crt_texture);
+	free(crt_src);
+	free(crt_dest);
 #endif
 	if (renderer) SDL_DestroyRenderer(renderer);
 	if (window) SDL_CloseAudio();
 	SDL_Quit();
 }
 
-
+// returns -1 if the SDL window is closed, otherwise 0
 int vdp_update(void)
 {
 	SDL_Event event;
 	while (SDL_PollEvent(&event)) {
 		if (event.type == SDL_QUIT) {
-			fprintf(stderr, "SDL_QUIT %f fps\n", frames*1000.0/(SDL_GetTicks()-first_tick));
 			return -1;
 		} else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
 			SDL_KeyboardEvent *key = &event.key;
 			Uint16 mod = key->keysym.mod;
 			int kdn = event.type == SDL_KEYDOWN;
 			int k = -1;
+			int alphalock = 0; //kdn && (mod & KMOD_SHIFT) ? TI_ALPHALOCK : 0;
+
 
 			// use sym for virtual key representation (mapped keyboard layout)
 			switch (key->keysym.sym) {
@@ -715,49 +454,49 @@ int vdp_update(void)
 			case SDLK_RCTRL:  k = TI_CTRL; break;
 
 			case SDLK_PERIOD: k = TI_PERIOD; break;
-			case SDLK_l:      k = TI_L; break;
-			case SDLK_o:      k = TI_O; break;
+			case SDLK_l:      k = TI_L+alphalock; break;
+			case SDLK_o:      k = TI_O+alphalock; break;
 			case SDLK_9:      k = TI_9; break;
 			case SDLK_2:      k = TI_2; break;
-			case SDLK_s:      k = TI_S; break;
-			case SDLK_w:      k = TI_W; break;
-			case SDLK_x:      k = TI_X; break;
+			case SDLK_s:      k = TI_S+alphalock; break;
+			case SDLK_w:      k = TI_W+alphalock; break;
+			case SDLK_x:      k = TI_X+alphalock; break;
 
 			case SDLK_COMMA:  k = TI_COMMA; break;
-			case SDLK_k:      k = TI_K; break;
-			case SDLK_i:      k = TI_I; break;
+			case SDLK_k:      k = TI_K+alphalock; break;
+			case SDLK_i:      k = TI_I+alphalock; break;
 			case SDLK_8:      k = TI_8; break;
 			case SDLK_3:      k = TI_3; break;
-			case SDLK_d:      k = TI_D; break;
-			case SDLK_e:      k = TI_E; break;
-			case SDLK_c:      k = TI_C; break;
+			case SDLK_d:      k = TI_D+alphalock; break;
+			case SDLK_e:      k = TI_E+alphalock; break;
+			case SDLK_c:      k = TI_C+alphalock; break;
 
-			case SDLK_m:      k = TI_M; break;
-			case SDLK_j:      k = TI_J; break;
-			case SDLK_u:      k = TI_U; break;
+			case SDLK_m:      k = TI_M+alphalock; break;
+			case SDLK_j:      k = TI_J+alphalock; break;
+			case SDLK_u:      k = TI_U+alphalock; break;
 			case SDLK_7:      k = TI_7; break;
 			case SDLK_4:      k = TI_4; break;
-			case SDLK_f:      k = TI_F; break;
-			case SDLK_r:      k = TI_R; break;
-			case SDLK_v:      k = TI_V; break;
+			case SDLK_f:      k = TI_F+alphalock; break;
+			case SDLK_r:      k = TI_R+alphalock; break;
+			case SDLK_v:      k = TI_V+alphalock; break;
 
-			case SDLK_n:      k = TI_N; break;
-			case SDLK_h:      k = TI_H; break;
-			case SDLK_y:      k = TI_Y; break;
+			case SDLK_n:      k = TI_N+alphalock; break;
+			case SDLK_h:      k = TI_H+alphalock; break;
+			case SDLK_y:      k = TI_Y+alphalock; break;
 			case SDLK_6:      k = TI_6; break;
 			case SDLK_5:      k = TI_5; break;
-			case SDLK_g:      k = TI_G; break;
-			case SDLK_t:      k = TI_T; break;
-			case SDLK_b:      k = TI_B; break;
+			case SDLK_g:      k = TI_G+alphalock; break;
+			case SDLK_t:      k = TI_T+alphalock; break;
+			case SDLK_b:      k = TI_B+alphalock; break;
 
 			case SDLK_SLASH:  k = TI_SLASH; break;
 			case SDLK_SEMICOLON: k = TI_SEMICOLON; break;
-			case SDLK_p:      k = TI_P; break;
+			case SDLK_p:      k = TI_P+alphalock; break;
 			case SDLK_0:      k = TI_0; break;
 			case SDLK_1:      k = TI_1; break;
-			case SDLK_a:      k = TI_A; break;
-			case SDLK_q:      k = TI_Q; break;
-			case SDLK_z:      k = TI_Z; break;
+			case SDLK_a:      k = TI_A+alphalock; break;
+			case SDLK_q:      k = TI_Q+alphalock; break;
+			case SDLK_z:      k = TI_Z+alphalock; break;
 
 			case SDLK_TAB:    k = TI_FIRE1; break;
 			case SDLK_LEFT:   k = TI_LEFT1; break;
@@ -767,7 +506,15 @@ int vdp_update(void)
 
 			case SDLK_BACKSPACE: k = TI_S | TI_ADDFCTN; break;
 			case SDLK_DELETE: k = TI_1 | TI_ADDFCTN; break;
-			case SDLK_INSERT: k = TI_2 | TI_ADDFCTN; break;
+			case SDLK_INSERT:
+				if ((mod & KMOD_SHIFT) && kdn) {
+					char *text = SDL_GetClipboardText();
+					if (text && text[0]) paste_text(text, current_mfps);
+					SDL_free(text);
+				} else {
+					k = TI_2 | TI_ADDFCTN;
+				}
+				break;
 			case SDLK_BACKQUOTE: k = TI_C | TI_ADDFCTN; break;
 			case SDLK_LEFTBRACKET: k = (mod & KMOD_SHIFT ? TI_G : TI_R) | TI_ADDFCTN; break;
 			case SDLK_RIGHTBRACKET: k = (mod & KMOD_SHIFT ? TI_F : TI_T) | TI_ADDFCTN; break;
@@ -798,16 +545,46 @@ int vdp_update(void)
 
 			case SDLK_PAGEUP:   k = TI_PAGEUP; break;
 			case SDLK_PAGEDOWN: k = TI_PAGEDN; break;
+			case SDLK_HOME:
+				if (mod == 0) {
+					k = TI_HOME;
+				} else if (kdn && (mod & KMOD_CTRL)) {
+					debug_en = !debug_en;
+					if (!debug_en)
+						debug_break = DEBUG_RUN;
+				}
+				break;
+			case SDLK_END:
+				if (kdn && mod == 0) k = TI_END;
+				break;
 
-			case SDLK_HOME: if (kdn && (mod & KMOD_CTRL)) debug_en = !debug_en; break;
+			case SDLK_F1:
+				if (debug_en) {
+					if (kdn) debug_break = !debug_break;
+				} else {
+					k = TI_1+TI_ADDFCTN;
+				}
+				break;
+			case SDLK_F2:
+				if (debug_en) {
+					if (kdn) debug_break = (mod & KMOD_SHIFT) ? DEBUG_FRAME_STEP : DEBUG_SINGLE_STEP;
+				} else {
+					k = TI_2+TI_ADDFCTN;
+				}
+				break;
+			case SDLK_F3: k = TI_3+TI_ADDFCTN; break;
+			case SDLK_F4: k = TI_4+TI_ADDFCTN; break;
+			case SDLK_F5: k = TI_5+TI_ADDFCTN; break;
+			case SDLK_F6: k = TI_6+TI_ADDFCTN; break;
+			case SDLK_F7: k = TI_7+TI_ADDFCTN; break;
+			case SDLK_F8: k = TI_8+TI_ADDFCTN; break;
+			case SDLK_F9: k = TI_9+TI_ADDFCTN; break;
+			case SDLK_F10: k = TI_0+TI_ADDFCTN; break;
 
-			case SDLK_F1: if (kdn) debug_break = !debug_break; break;
-			case SDLK_F2: if (kdn) debug_break = (mod & KMOD_SHIFT) ? 3 : 2; break;
+
 			case SDLK_F11: if (kdn) SDL_SetWindowFullscreen(window, (config_fullscreen ^= SDL_WINDOW_FULLSCREEN)); break;
-			case SDLK_F12: if (mod & KMOD_CTRL) reset(); break;
-			//case SDLK_F3: if (kdn) printf("%d\n", ++test); break;
-			//case SDLK_F4: if (kdn) printf("%d\n", --test); break;
-			case SDLK_F5: if (kdn) config_crt_filter ^= 1; break;
+			case SDLK_F12: if (!kdn) break; if (mod & KMOD_CTRL) reset(); else debug_en =! debug_en; break;
+			//case SDLK_F5: if (kdn) config_crt_filter = (config_crt_filter + 1) % 3; vdp_set_filter(); break;
 			default: break;
 			}
 
@@ -820,13 +597,22 @@ int vdp_update(void)
 					set_key(kdn ? TI_Z : TI_A, 0);
 					set_key(kdn ? TI_O : TI_P, 0);
 				}
-				set_key(k & 0x3f, kdn);
+				if (!kdn) set_key(k & 0x3f, 0); // on keyup, set meta after
 				if (k & TI_ADDSHIFT) {
 					set_key(TI_SHIFT, kdn || (mod & KMOD_SHIFT));
 				}
 				if (k & TI_ADDFCTN) {
 					set_key(TI_FCTN, kdn || (mod & KMOD_ALT));
 					set_key(TI_SHIFT, !kdn && (mod & KMOD_SHIFT));
+				}
+				if (kdn) {
+					if ((k & (TI_ADDCTRL|TI_ADDSHIFT|TI_ADDFCTN)) == 0) {
+						// clear meta keys that are not actually held
+						set_key(TI_CTRL, !!(mod & KMOD_CTRL));
+						set_key(TI_FCTN, !!(mod & KMOD_ALT));
+						set_key(TI_SHIFT, !!(mod & KMOD_SHIFT));
+					}
+					set_key(k & (0x3f|TI_ALPHALOCK), 1); // on keydown, set meta first
 				}
 
 			}
@@ -837,15 +623,11 @@ int vdp_update(void)
 	}
 
 	if (renderer) {
+		SDL_Rect src = {.x = 0, .y = 0, .w = texture_len, .h = 240};
 		SDL_Rect dst = {.x = 0, .y = 0, .w = scale_w, .h = scale_h};
-		if (debug_en) {
-			SDL_RenderCopy(renderer, debug_texture, NULL, NULL);
-			dst.w /= 2;
-			dst.h /= 2;
-		}
+
 #ifdef ENABLE_CRT
 		if (config_crt_filter == 2) {
-			SDL_Rect src = {.x = 0, .y = 0, .w = 320, .h = 240};
 			struct NTSC_SETTINGS ntsc = {
 				.w = src.w,
 				.h = src.h - 4,  // FIXME: why does this fix blurry lines?
@@ -858,49 +640,47 @@ int vdp_update(void)
 #endif
 			};
 			int noise = 4;
-			int pitch;
+			int pitch = 640*4;
+			void *pixels;
 
-			SDL_LockTexture(texture, &src, (void**)&ntsc.rgb, &pitch);
+			ntsc.rgb = crt_src;
 #if defined(CRT_MAJOR) && CRT_MAJOR == 2
 			crt_modulate(&crt, &ntsc);
 #else
 			ntsc.pitch = pitch/4;
 			crt_2ntsc(&crt, &ntsc);
 #endif
-			SDL_UnlockTexture(texture);
 
 			src.w = CRT_W;
 			src.h = CRT_H;
 			crt.outh = CRT_H;
-			SDL_LockTexture(crt_texture, &src, (void**)&crt.out, &pitch);
+
+			SDL_LockTexture(texture, &src, (void**)&pixels, &pitch);
+
+			crt.out = crt_dest;
 #if defined(CRT_MAJOR) && CRT_MAJOR == 2
 			crt_demodulate(&crt, noise);
 #else
 			crt.outpitch = pitch/4;
 			crt_draw(&crt, noise);
 #endif
-			SDL_UnlockTexture(crt_texture);
-
-			SDL_RenderCopy(renderer, crt_texture, &src, &dst);
+			memcpy(pixels, crt.out, src.h * pitch);
+			SDL_UnlockTexture(texture);
+		}
+#endif
+		if (debug_en) {
+			SDL_Rect rect = {.x = 0, .y = 0, .w = 320, .h = 240};
+			SDL_RenderClear(renderer);
+			SDL_RenderCopy(renderer, debug_texture, NULL, NULL);
+			SDL_RenderCopy(renderer, texture, &src, &rect);
 		} else {
-			SDL_RenderCopy(renderer, texture, NULL, &dst);
+			SDL_RenderCopy(renderer, texture, &src, NULL);
 		}
 		if (menu_active) {
 			// menu overlay
 			SDL_Rect src = {.x = 0, .y = 0, .w = 320, .h = 240};
 			SDL_RenderCopy(renderer, debug_texture, &src, NULL);
 		}
-#else
-		if (debug_en) {
-			//SDL_RenderCopy(renderer, debug_texture, NULL, NULL);
-			SDL_RenderCopy(renderer, texture, &src, NULL);
-		} else {
-			SDL_RenderCopy(renderer, texture, NULL, NULL);
-			if (menu_active) {
-				SDL_RenderCopy(renderer, debug_texture, NULL, NULL);
-			}
-		}
-#endif
 
 		// TODO use SDL_GetTicks() to determine actual framerate and 
 		// dupe/drop frames to achieve desired VDP freq

@@ -43,8 +43,8 @@ extern u16 safe_r(u16 address);
 extern u16 map_r(u16 address);
 extern void map_w(u16 address, u16 value);
 
-extern void clear_all_breakpoints(void);
-extern void set_breakpoint(u16 base, u16 size);
+extern void cpu_reset_breakpoints(void); // clear all
+extern void cpu_set_breakpoint(u16 base, u16 size);
 
 
 
@@ -53,12 +53,19 @@ enum {
 	PAL_FPS = 50000,
 	NTSC_FPS = 59940,
 };
+enum {
+	FILTER_SMOOTH,
+	FILTER_PIXELATED,
+	FILTER_CRT,
+};
 extern void vdp_set_fps(int mfps /* fps*1000 */);
 extern void snd_w(unsigned char byte);
 extern void vdp_init(void);
 extern void vdp_done(void);
 extern int vdp_update(void);
-extern void vdp_line(unsigned int y, u8* restrict reg, u8* restrict ram);
+//extern void vdp_line(unsigned int y, u8* restrict reg, u8* restrict ram);
+extern void vdp_lock_texture(int line, int len, void**pixels, int *pitch);
+extern void vdp_unlock_texture(void);
 extern void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight_line);
 extern void vdp_text_pat(unsigned char *pat);
 extern void mute(int en);
@@ -76,6 +83,13 @@ extern int debug_window(void);
  // bulwip.c
 extern void reset(void);
 extern int debug_en; // debug mode active
+enum {
+	DEBUG_RUN = 0,
+	DEBUG_STOP = 1,
+	DEBUG_SINGLE_STEP = 2,
+	DEBUG_FRAME_STEP = 3,
+	DEBUG_SCANLINE_STEP = 4,
+};
 extern int debug_break; // 0=running 1=pause 2=single step 3=frame step
 extern int config_crt_filter; // 0=smooth 1=pixelated 2=crt
 extern int debug_log(const char *fmt, ...);
@@ -83,7 +97,16 @@ extern int print_asm(const char *fmt, ...);
 
 extern int breakpoint_read(u16 address); // called from brk_r()
 extern int breakpoint_write(u16 address); // called from brk_w()
-extern void toggle_breakpoint(u16 address, int bank);
+extern void set_breakpoint(u16 address, int bank, int enable); // enable=-1 to toggle, 0=disable, 1=enable, 2=paste
+extern int get_breakpoint(int address, int bank); // returns enable or -1 if not found
+extern void remove_breakpoint(u16 address, int bank);
+extern int enum_breakpoint(int index, int *address, int *bank, int *enabled);
+enum {
+	BREAKPOINT_TOGGLE = -1,
+	BREAKPOINT_DISABLE = 0,
+	BREAKPOINT_ENABLE = 1,
+	BREAKPOINT_PASTE = 2,
+};
 
 // external CRU functions
 extern u8 cru_r(u16 bit);
@@ -93,11 +116,13 @@ extern void set_key(int k, int val); // called from vdp_update()
 // things needed by ui.c
 extern int test_key(int key);
 extern int wait_key(void);
+extern void reset_keys(void);
 extern void update_debug_window(void);
 extern void redraw_vdp(void);
 extern int vdp_update_or_menu(void);
 extern void set_cart_name(char *name);
 extern int get_cart_bank(void);
+extern void paste_text(char *text, int old_fps);
 
 
 
@@ -121,9 +146,13 @@ enum {  // bits[5..3]=row  bits[2..0]=col
 /*r6*/	TI_FIRE1=48, TI_LEFT1, TI_RIGHT1, TI_DOWN1, TI_UP1,
 /*r7*/	TI_FIRE2=56, TI_LEFT2, TI_RIGHT2, TI_DOWN2, TI_UP2,
 	TI_ADDSHIFT = 1<<6,
-	TI_ADDFCTN = 2<<6,
+	TI_ADDFCTN = 1<<7,
+	TI_ADDCTRL = 1<<8,
+	TI_ALPHALOCK = 1<<9,
 	TI_PAGEUP = TI_ADDFCTN | TI_6, // 6=E/A Roll down  9=BACK
 	TI_PAGEDN = TI_ADDFCTN | TI_4, // 4=E/A Roll up    6=PROC'D
+	TI_HOME = 54,
+	TI_END = 55,
 };
 
 
