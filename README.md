@@ -12,10 +12,10 @@ Requires ROM and GROM files: 994arom.bin, 994agrom.bin.  Put them in the same di
 
 Keyboard usage:
 - ESC: Load Cartridges/Settings/Quit menu
-- Ctrl-Home: Toggle debugger interface
-- F5: Toggle CRT filter
 - F11: Toggle full-screen
+- F12 or Ctrl-Home: Toggle debugger interface
 - Ctrl-F12: Reset and reload current cartridge/listings
+- Shift-Insert: Paste from clipboard
 - Arrow keys and Tab are mapped to Joystick 1.
 
 Loading Cartridges:
@@ -28,11 +28,11 @@ While debugger is open:
 - F2: Single instruction step
 - Ctrl-F2: Single frame step
 - Up/Down/PgUp/PgDn: move highlighted line in listing
+- Home/End: Go to start/end of listing
 - B: Toggle breakpoint at current line
+- Ctrl->F: Find text string
+- Ctrl->G: Repeat last find
+- Shift-Ctrl->G: Repeat last find, reverse direction
 - TODO Ctrl->B: Go to referenced label
-- TODO Ctrl->F: Find text string
-- TODO Ctrl->G: Repeat last find
-- TODO Shift-Ctrl->G: Repeat last find, reverse direction
-- TODO Home/End: Go to start/end of listing
 
 
