@@ -225,17 +225,17 @@ init_eq(struct EQF *f,
     f->g[2] = g_hi;
     
     crt_sincos14(&sn, &cs, T14_PI * f_lo / rate);
-    if (EQ_P >= 15) {
+#if EQ_P >= 15
         f->lf = 2 * (sn << (EQ_P - 15));
-    } else {
+#else
         f->lf = 2 * (sn >> (15 - EQ_P));
-    }
+#endif
     crt_sincos14(&sn, &cs, T14_PI * f_hi / rate);
-    if (EQ_P >= 15) {
+#if EQ_P >= 15
         f->hf = 2 * (sn << (EQ_P - 15));
-    } else {
+#else
         f->hf = 2 * (sn >> (15 - EQ_P));
-    }
+#endif
 }
 
 static void

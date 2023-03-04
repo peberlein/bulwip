@@ -59,7 +59,7 @@ extern "C" {
 #define CRT_CB_FREQ     4 /* or make it 3 for an even blurrier image */
 #endif
 #else
-#define CRT_CB_FREQ     4 /* carrier frequency relative to sample rate */
+#define CRT_CB_FREQ     5 /* carrier frequency relative to sample rate */
 #endif
 #define CRT_HRES        (CRT_CC_LINE * CRT_CB_FREQ / 10) /* horizontal res */
 #define CRT_VRES        262                       /* vertical resolution */
