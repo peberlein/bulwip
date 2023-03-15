@@ -36,10 +36,9 @@ While debugger is open:
 - B: Toggle breakpoint at current line
 - Del: Remove breakpoint at current line
 - F5: List breakpoints
--   Enter: Go to selected breakpoint
--   Space: Toggle selected breakpoint
--   Del: Remove selected breakpoint
-
+  - Enter: Go to selected breakpoint
+  - Space: Toggle selected breakpoint
+  - Del: Remove selected breakpoint
 - TODO Ctrl->B: Go to referenced label
 
 
