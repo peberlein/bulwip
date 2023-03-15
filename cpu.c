@@ -765,7 +765,7 @@ execute_op:
 			switch ((op >> 7) & 7) {
 			case 0: goto UNHANDLED;
 			case 1: goto UNHANDLED;
-			case 2: // SZCB
+			case 2: SZCB:
 				if (td.addr & 1) {
 					td.val &= ~(ts >> 8);
 					status_parity(status_zero(td.val << 8));
@@ -775,7 +775,7 @@ execute_op:
 				}
 				mem_w_TdB(op, wp, td);
 				goto decode_op;
-			case 3: // SB
+			case 3: SB:
 				if (td.addr & 1) {
 					td.val = (td.val & 0xff00) | status_parity(sub(td.val << 8, ts) >> 8);
 				} else {
@@ -783,7 +783,7 @@ execute_op:
 				}
 				mem_w_TdB(op, wp, td);
 				goto decode_op;
-			case 4: // CB
+			case 4: CB:
 				if (td.addr & 1) {
 					status_arith(status_parity(ts), td.val << 8);
 				} else {
@@ -791,7 +791,7 @@ execute_op:
 				}
 				Td_post_increment(op, wp, td, 1);
 				goto decode_op;
-			case 5: // AB
+			case 5: AB:
 				if (td.addr & 1) {
 					td.val = (td.val & 0xff00) | status_parity(add(td.val << 8, ts) >> 8);
 				} else {
@@ -799,7 +799,7 @@ execute_op:
 				}
 				mem_w_TdB(op, wp, td);
 				goto decode_op;
-			case 6: // MOVB
+			case 6: MOVB:
 				if (td.addr & 1) {
 					td.val = (td.val & 0xff00) | status_parity(status_zero(ts) >> 8);
 				} else {
@@ -807,7 +807,7 @@ execute_op:
 				}
 				mem_w_TdB(op, wp, td);
 				goto decode_op;
-			case 7: // SOCB
+			case 7: SOCB:
 				if (td.addr & 1) {
 					td.val |= (ts >> 8);
 					status_parity(status_zero(td.val << 8));
@@ -837,26 +837,26 @@ execute_op:
 		}
 	case 7-2:   // opcodes 0x2000 .. 0x3fff
 		switch ((op >> 10) & 7) {
-		case 0: { // COC
+		case 0: COC: {
 			u16 ts = Ts(op, &pc, wp);
 			u16 td = reg_r(wp, (op >> 6) & 15);
 			if ((ts & td) == ts) set_EQ(); else clr_EQ();
 			goto decode_op;
 			}
-		case 1: { // CZC
+		case 1: CZC: {
 			u16 ts = Ts(op, &pc, wp);
 			u16 td = reg_r(wp, (op >> 6) & 15);
 			if (!(ts & td)) set_EQ(); else clr_EQ();
 			goto decode_op;
 			}
-		case 2: { // XOR
+		case 2: XOR: {
 			u8 reg = (op >> 6) & 15;
 			u16 ts = Ts(op, &pc, wp);
 			u16 td = reg_r(wp, reg);
 			reg_w(wp, reg, status_zero(ts ^ td));
 			goto decode_op;
 			}
-		case 3: { // XOP
+		case 3: XOP: {
 			struct val_addr td = Td(op, &pc, wp); // source
 			u8 reg = (op >> 6) & 15; // XOP number usually 1 or 2
 			u16 ts = mem_r(0x0040 + (reg << 2)); // new WP
@@ -873,7 +873,7 @@ execute_op:
 
 			goto decode_op_now; // next instruction cannot be interrupted
 			}
-		case 4: { // LDCR
+		case 4: LDCR: {
 			u8 idx, c = ((op >> 6) & 15) ?: 16;
 			u16 ts, reg = (reg_r(wp, 12) & 0x1ffe) >> 1;
 			if (c <= 8) {
@@ -888,7 +888,7 @@ execute_op:
 			status_zero(ts);
 			goto decode_op;
 			}
-		case 5: { // STCR
+		case 5: STCR: {
 			struct val_addr td;
 			u8 idx, c = ((op >> 6) & 15) ?: 16;
 			u16 reg = (reg_r(wp, 12) & 0x1ffe) >> 1;
@@ -922,7 +922,7 @@ execute_op:
 			// TODO status bits
 			goto decode_op;
 			}
-		case 6: { // MPY
+		case 6: MPY: {
 			u32 val = Ts(op, &pc, wp);
 			u8 reg = (op >> 6) & 15;
 			//debug_log("MPY %04X x %04X = %08X\n", 
@@ -932,7 +932,7 @@ execute_op:
 			reg_w(wp, reg+1, val & 0xffff);
 			goto decode_op;
 			}
-		case 7: { // DIV
+		case 7: DIV: {
 			u32 val;
 			u16 ts = Ts(op, &pc, wp);
 			u8 reg = (op >> 6) & 15;

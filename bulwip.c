@@ -607,7 +607,7 @@ static void mem_init(void)
  ****************************************/
 
 // 0-7 unshifted keys 8-15 shifted keys 16-23 function keys
-u8 keyboard[8] = {0}, keyboard_down[8] = {0};
+u8 keyboard[8] = {0};
 static u8 keyboard_row = 0;
 static u8 timer_mode = 0;
 static unsigned int total_cycles = 0;
@@ -617,65 +617,10 @@ void set_key(int key, int val)
 {
 	int row = (key >> 3) & 7, col = key & 7, mask = val << col;
 	keyboard[row] = (keyboard[row] & ~(1 << col)) | mask;
-	if (val) {
-		//printf("key=%d row=%d\n", key, row);
-		keyboard_down[row] |= 1 << col;
-	} else {
-		keyboard_down[row] &= ~(1 << col);
-	}
-	alpha_lock = !!(key & TI_ALPHALOCK);
+	//alpha_lock = !!(key & TI_ALPHALOCK); // FIXME
 }
 
-#ifndef TEST
-// returns a single keydown enum from TI_*
-int wait_key(void)
-{
-	extern int menu_active; // sdl.c
-	int i;
-	do {
-		for (i = 0; i < ARRAY_SIZE(keyboard_down); i++) {
-			int b = keyboard_down[i];
-			if (b == 0) continue;
-			// get only one key
-			b = __builtin_ctz(b);
-			keyboard_down[i] &= ~(1 << b);
-			if (keyboard[0] & (1<<TI_FCTN)) b += TI_ADDFCTN;
-			if (keyboard[0] & (1<<TI_CTRL)) b += TI_ADDCTRL;
-			if (keyboard[0] & (1<<TI_SHIFT)) b += TI_ADDSHIFT;
-			return (i&7)*8+b;
-		}
-		i = vdp_update();
-		if (menu_active == 0 && debug_en && debug_break != DEBUG_STOP)
-			return 0;
-	} while (i != -1);
-	return -1; // Window closed
-}
 
-int test_key(int key)
-{
-	int row = (key >> 3) & 7, col = key & 7, mask = 1 << col;
-	if (keyboard_down[row] & mask) {
-		printf("row=%d mask=%x key=%02x\n", row, mask, key);
-		if ((key & TI_ADDFCTN) && !(keyboard[0] & (1<<TI_FCTN))) return 0;
-		if ((key & TI_ADDCTRL) && !(keyboard[0] & (1<<TI_CTRL))) return 0;
-		if ((key & TI_ADDSHIFT) && !(keyboard[0] & (1<<TI_SHIFT))) return 0;
-		keyboard_down[row] ^= mask; // toggle it off
-		return 1;
-	}
-	return 0;
-}
-#endif
-
-void reset_keys(void)
-{
-	memset(&keyboard_down, 0, sizeof(keyboard_down)); // clear keys
-}
-
-int key_pressed(void)
-{
-	static const u8 zero[ARRAY_SIZE(keyboard_down)] = {};
-	return !memcmp(zero, keyboard_down, ARRAY_SIZE(keyboard_down));
-}
 
 void reset_ti_keys(void)
 {
@@ -1508,7 +1453,7 @@ static void paste_char(void)
 			}
 			c = 13; // LF to CR
 		}
-		printf("b=%d  %04x %04x %d %c\n", b, fast_ram[0x74>>1],
+		if(0)printf("b=%d  %04x %04x %d %c\n", b, fast_ram[0x74>>1],
 				fast_ram[0x7c>>1],
 				c, c);
 		if (c == 0) {
@@ -1647,7 +1592,7 @@ int breakpoint_index(u16 address, int bank)
 	int i;
 	for (i = 0; i < breakpoint_count; i++) {
 		if (breakpoint[i].address == address) {
-			if (bank == -1 || bank == breakpoint[i].bank == bank) {
+			if (bank == -1 || bank == breakpoint[i].bank) {
 				return i;
 			}
 		}
@@ -1821,13 +1766,14 @@ int vdp_update_or_menu(void)
 	if (vdp_update() != 0)
 		return -1; // quitting
 #ifndef TEST
-	if (keyboard_down[0] & (1 << TI_MENU)) {
-		reset_keys();
+	if (keyboard[0] & (1 << TI_MENU)) {
+		set_ui_key(0); // reset ui keys
 		mute(1);
 		if (main_menu() == -1)
 			return -1; // quitting
 		if (debug_break == DEBUG_RUN)
 			mute(0);
+		set_key(TI_MENU, 0); // unset the key so don't retrigger menu
 	}
 #endif
 	return 0;
@@ -1869,29 +1815,28 @@ void update_debug_window(void)
 	vdp_text_window(reg, 53, 30, 320, 0, -1);
 	} else {
 		sprintf((char*)reg,
-	      "\n  VDP0: %02X      PC: %04X\n"
-		"  VDP1: %02X      WP: %04X\n"
-		"  VDP2: %02X      ST: %04X\n"
-		"  VDP3: %02X              \n"
-		"  VDP4: %02X      R 0: %04X\n"
-		"  VDP5: %02X      R 1: %04X\n"
-		"  VDP6: %02X      R 2: %04X\n"
-		"  VDP7: %02X      R 3: %04X\n"
-		" VDP: %04X      R 4: %04X\n"
-		" VDPST: %02X      R 5: %04X\n"
-		"  Y: %-3d        R 6: %04X\n"
-		" BANK: %-4d     R 7: %04X\n"
-		"                R 8: %04X\n"
-		"                R 9: %04X\n"
-		"                R10: %04X\n"
-		"                R11: %04X\n"
-		"                R12: %04X\n"
-		"                R13: %04X\n"
-		"                R14: %04X\n"
-		"                R15: %04X\n"
+	      "\n  VDP0: %02X   PC: %04X\n"
+		"  VDP1: %02X   WP: %04X\n"
+		"  VDP2: %02X   ST: %04X\n"
+		"  VDP3: %02X          \n"
+		"  VDP4: %02X   R0: %04X\n"
+		"  VDP5: %02X   R1: %04X\n"
+		"  VDP6: %02X   R2: %04X\n"
+		"  VDP7: %02X   R3: %04X\n"
+		" VDP: %04X   R4: %04X\n"
+		" VDPST: %02X   R5: %04X\n"
+		"  Y: %-3d     R6: %04X\n"
+		" BANK: %-4d  R7: %04X\n"
+		"             R8: %04X\n"
+		"             R9: %04X\n"
+		"            R10: %04X\n"
+		"            R11: %04X\n"
+		"            R12: %04X\n"
+		"            R13: %04X\n"
+		"            R14: %04X\n"
+		"            R15: %04X\n"
 		" KB: ROW: %d\n"
-		" %02X %02X %02X %02X %02X %02X %02X %02X\n\n"
-		"%s        (%d)\n                                          \n",
+		"%02X %02X %02X %02X %02X %02X %02X %02X\n\n",
 		vdp.reg[0], pc,
 		vdp.reg[1], wp,
 		vdp.reg[2], get_st(),
@@ -1914,9 +1859,8 @@ void update_debug_window(void)
 			    safe_r(wp+30),
 		keyboard_row,
 		keyboard[0], keyboard[1], keyboard[2], keyboard[3],
-		keyboard[4], keyboard[5], keyboard[6], keyboard[7],
-		asm_text, disasm_cyc);
-		vdp_text_window(reg, 26,30, 0,240, -1);
+		keyboard[4], keyboard[5], keyboard[6], keyboard[7]);
+		vdp_text_window(reg, 23,30, 0,240, -1);
 
 		// show fast ram state
 		int i, n = 0;
@@ -2003,6 +1947,7 @@ int main(int argc, char *argv[])
 #endif
 	}
 
+	//vdp_window_scale(4);
 	vdp_init();
 
 	reset();

@@ -8,7 +8,8 @@
 - Instruction loop is in a single function; keeping PC, WP, (maybe ST) in host CPU registers
 - Instruction decoding functions inlined; better branch prediction
 
-Requires ROM and GROM files: 994arom.bin, 994agrom.bin.  Put them in the same directory as the emulator executable.
+Requires ROM and GROM files: 994arom.bin, 994agrom.bin.  Put them in the same directory as the emulator executable. 
+(If you want to have a ROM source listing, it should be named '994arom.lst'.)
 
 Keyboard usage:
 - ESC: Load Cartridges/Settings/Quit menu
@@ -29,10 +30,16 @@ While debugger is open:
 - Ctrl-F2: Single frame step
 - Up/Down/PgUp/PgDn: move highlighted line in listing
 - Home/End: Go to start/end of listing
+- Ctrl-F: Find text string
+- Ctrl-G: Repeat last find
+- Shift-Ctrl-G: Repeat last find, reverse direction
 - B: Toggle breakpoint at current line
-- Ctrl->F: Find text string
-- Ctrl->G: Repeat last find
-- Shift-Ctrl->G: Repeat last find, reverse direction
+- Del: Remove breakpoint at current line
+- F5: List breakpoints
+-   Enter: Go to selected breakpoint
+-   Space: Toggle selected breakpoint
+-   Del: Remove selected breakpoint
+
 - TODO Ctrl->B: Go to referenced label
 
 

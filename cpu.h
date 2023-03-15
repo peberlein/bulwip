@@ -77,6 +77,7 @@ extern void vdp_set_filter(void);
 extern void load_listing(const char *filename, int bank);
 extern int main_menu(void);
 extern int debug_window(void);
+extern void set_ui_key(int);
 
 
 
@@ -114,9 +115,9 @@ extern void cru_w(u16 bit, u8 value);
 extern void set_key(int k, int val); // called from vdp_update()
 
 // things needed by ui.c
-extern int test_key(int key);
-extern int wait_key(void);
-extern void reset_keys(void);
+//extern int test_key(int key);
+//extern int wait_key(void);
+//extern void reset_keys(void);
 extern void update_debug_window(void);
 extern void redraw_vdp(void);
 extern int vdp_update_or_menu(void);
@@ -151,6 +152,8 @@ enum {  // bits[5..3]=row  bits[2..0]=col
 	TI_ALPHALOCK = 1<<9,
 	TI_PAGEUP = TI_ADDFCTN | TI_6, // 6=E/A Roll down  9=BACK
 	TI_PAGEDN = TI_ADDFCTN | TI_4, // 4=E/A Roll up    6=PROC'D
+	TI_DELETE = TI_ADDFCTN | TI_1,
+	TI_INSERT = TI_ADDFCTN | TI_2,
 	TI_HOME = 54,
 	TI_END = 55,
 };

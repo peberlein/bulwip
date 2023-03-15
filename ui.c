@@ -45,6 +45,39 @@
 
 #include "cpu.h"
 
+
+#define CLEAR  0x00000000
+#define SHADOW 0x80000000
+#define BLACK  0xff000000
+#define GREEN  0xff009f00
+#define RED    0xffbf0000
+
+static int ui_key = 0;
+
+void set_ui_key(int k)
+{
+	ui_key = k;
+}
+
+static int wait_key(void)
+{
+	extern int menu_active; // sdl.c
+	int i;
+	do {
+		if (ui_key) {
+			i = ui_key;
+			ui_key = 0;
+			return i;
+		}
+		i = vdp_update();
+		if (menu_active == 0 && debug_en && debug_break != DEBUG_STOP)
+			return 0;
+	} while (i != -1);
+	return -1; // Window closed
+}
+
+
+
 static void *safe_alloc(size_t size)
 {
 	void *p = calloc(1, size);
@@ -174,6 +207,16 @@ static struct list_segment {
 	const char *src; // source code
 	struct list_segment *next; // singly-linked list
 } *listings = NULL;
+
+int get_line_bank(const char *lst, unsigned int offset)
+{
+	struct list_segment *seg;
+	for (seg = listings; seg; seg = seg->next) {
+		if (lst == seg->src && offset >= seg->start_off && offset <= seg->end_off)
+			return seg->bank;
+	}
+	return -1; // not found, could be any bank
+}
 
 static struct list_segment *new_list_segment(const char *src, unsigned int len)
 {
@@ -313,7 +356,7 @@ void load_listing(const char *filename, int bank)
 
 
 // search the listing for the address pc
-static struct list_segment* listing_search(u16 pc, unsigned int *offset)
+static struct list_segment* listing_search(u16 pc, unsigned int *offset, int bank)
 {
 	unsigned int a, b, c;
 	int a_pc = -1, b_pc = -1, c_pc = -1;
@@ -326,7 +369,7 @@ static struct list_segment* listing_search(u16 pc, unsigned int *offset)
 		if (seg->start_addr <= pc && pc <= seg->end_addr) {
 			if (pc < 0x6000 || pc >= 0x8000)
 				break; // not banked
-			if (seg->bank == -1 || seg->bank == get_cart_bank()) {
+			if (seg->bank == -1 || seg->bank == bank) {
 				break; // matched bank
 			}
 		}
@@ -400,6 +443,7 @@ static struct list_segment* listing_search(u16 pc, unsigned int *offset)
 
 static void draw_listing(struct list_segment *seg, unsigned int *offset, int *line, int delta)
 {
+	int w = 83, h = 30;
 	while (delta < 0) {
 		unsigned int old_offset = *offset;
 		*offset = prev_line(seg->src, seg->src_len, *offset);
@@ -414,22 +458,43 @@ static void draw_listing(struct list_segment *seg, unsigned int *offset, int *li
 			(*line)++;
 		delta--;
 	}
-	vdp_text_window(seg->src + *offset, 80, 30, 640-80*6, 240, *line);
+	vdp_text_window(seg->src + *offset, w, h, 640-w*6, 240, *line);
 
+#if 0
 	int i = -1, pc;
 	char bp[32] = "";
 	unsigned int a = step_lines(seg->src, seg->src_len, *offset, *line);
-	//printf("line=%d offset=%u a=%u\n", *line, *offset, a);
+
 
 	pc = get_line_pc(seg->src, a);
 	if (pc != -1) {
-		i = get_breakpoint(pc, seg->bank);
+		int bank = get_line_bank(seg->src, a);
+		i = get_breakpoint(pc, bank);
+		printf("line=%d offset=%u a=%u pc=%x bank=%d\n", *line, *offset, a, pc, bank);
 		if (i != -1) {
 			sprintf(bp, " BREAKPOINT%s ", i ? "" : " DISABLED");
 			i = 0; // highlight the breakpoint indicator
 		}
 	}
 	vdp_text_window(bp, 30,1, 322,240-8, i);
+#else
+	unsigned int i = 0, a = *offset;
+	for (i = 0; i < h; i++) {
+		int pc = get_line_pc(seg->src, a);
+		int bp = -1;
+		if (pc != -1) {
+			int bank = get_line_bank(seg->src, a);
+			bp = get_breakpoint(pc, bank);
+			//printf("line=%d offset=%u a=%u pc=%x bank=%d\n", *line, *offset, a, pc, bank);
+		}
+		vdp_text_clear(640-(w+1)*6, 240+i*8, 1,1,
+				bp == -1 ? BLACK :
+				bp == 0 ? GREEN : RED);
+
+		a = next_line(seg->src, seg->src_len, a);
+	}
+
+#endif
 }
 
 
@@ -438,8 +503,6 @@ static void draw_listing(struct list_segment *seg, unsigned int *offset, int *li
 #define MENU_Y 96
 #define MENU_DIR_W 20
 #define MENU_DIR_H 20
-#define CLEAR  0x00000000
-#define SHADOW 0x80000000
 
 static int fps_menu(void)
 {
@@ -855,40 +918,74 @@ int main_menu(void)
 }
 
 
-static int show_breakpoints(void)
+static int breakpoints_menu(int *addr, int *cur_bank)
 {
 	extern int menu_active; // sdl.c
 	int ret = 0;
 	int w = 20, h = 0;
 	char *menu = NULL;
-	int len = 0;
-	int i;
+	int len, count, i;
 	int address, bank, enabled;
+
+	printf("%s: %x %d\n", __func__, *addr, *cur_bank);
+refresh:
+	free(menu);
+	menu = NULL;
+	h = 0;
+	len = 0;
+	count = 0;
+	i = 0;
+
 	while (enum_breakpoint(i++, &address, &bank, &enabled)) {
 		printf("len=%d address=%x bank=%d enabled=%d\n", len, address, bank, enabled);
 		menu = realloc(menu, len + 20);
 		if (bank != -1) {
 			sprintf(menu+len, "%04X:%d%s\n", address, bank,
-				enabled ? "" : "disabled");
+				enabled ? "" : " disabled");
 		} else {
 			sprintf(menu+len, "%04X%s\n", address,
-				enabled ? "" : "disabled");
+				enabled ? "" : " disabled");
 		}
 		h++;
 		len = strlen(menu);
 	}
-	
+	if (h == 0) {
+		menu_active = 0;
+		return 0; // no breakpoints set
+	}
+
 	menu_active = 1;
+	i = 0;
 
 	vdp_text_clear(0, 0, 320/6,240/8, CLEAR);
 	while (ret == 0) {
 		int len = strlen(menu);
 		int k;
 		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, 0x80000000); // shadow
-		vdp_text_window(menu, w,h, MENU_X,MENU_Y, -1);
-		vdp_text_window(menu, w-2,1, MENU_X+6,MENU_Y+8, -1);
+		vdp_text_window(menu, w,h, MENU_X,MENU_Y, i);
+		//vdp_text_window(menu, w-2,1, MENU_X+6,MENU_Y+8, -1);
 		k = wait_key();
 		if (k == -1) { ret = -1; break; }
+		if (k == TI_MENU) { ret = 0; break; }
+		switch (k) {
+		case TI_UP1: if (i > 0) i--; break;
+		case TI_DOWN1: if (i < h-1) i++; break;
+		case TI_ENTER:
+			enum_breakpoint(i, &address, &bank, &enabled);
+			*addr = address;
+			if (bank != -1)
+				*cur_bank = bank;
+			ret = 1;
+			break; // set addr and bank
+		case TI_SPACE: // toggle this breakpoint on/off
+			enum_breakpoint(i, &address, &bank, &enabled);
+			set_breakpoint(address, bank, -1/*toggle*/);
+			goto refresh;
+		case TI_DELETE: // remove this breakpoint
+			enum_breakpoint(i, &address, &bank, &enabled);
+			remove_breakpoint(address, bank);
+			goto refresh;
+		}
 
 	}
 	menu_active = 0;
@@ -1061,7 +1158,7 @@ static int do_find_reverse(const char *lst, unsigned int *offset, int *line)
 		o = next_line(lst, lst_len, o);
 	}
 	int word_len = line_len(find_stack, 0);
-	char word[word_len];
+	char word[word_len+1];
 	memcpy(word, find_stack, word_len);
 	word[word_len] = 0;
 	const char *p;
@@ -1125,19 +1222,94 @@ static void print_key(int k)
 	}
 }
 
+// Select a register with the arrow keys and enter to jump to its address
+// TODO Change bank with left/right
+static int reg_menu(int *addr, int *bank)
+{
+	char reg[21*10]; // 20 lines of up to 10
+	int i = 12;
+	int pc = get_pc(), wp = get_wp();
+	int k;
+
+	sprintf(reg,
+	        "PC: %04X\n"
+		"WP: %04X\n"
+		"ST: %04X\n"
+		"\n"
+		"R 0: %04X\n"
+		"R 1: %04X\n"
+		"R 2: %04X\n"
+		"R 3: %04X\n"
+		"R 4: %04X\n"
+		"R 5: %04X\n"
+		"R 6: %04X\n"
+		"R 7: %04X\n"
+		"R 8: %04X\n"
+		"R 9: %04X\n"
+		"R10: %04X\n"
+		"R11: %04X\n"
+		"R12: %04X\n"
+		"R13: %04X\n"
+		"R14: %04X\n"
+		"R15: %04X\n",
+		pc,
+		wp,
+		get_st(),
+		safe_r(wp),
+		safe_r(wp+2),
+		safe_r(wp+4),
+		safe_r(wp+6),
+		safe_r(wp+8),
+		safe_r(wp+10),
+		safe_r(wp+12),
+		safe_r(wp+14),
+		safe_r(wp+16),
+		safe_r(wp+18),
+		safe_r(wp+20),
+		safe_r(wp+22),
+		safe_r(wp+24),
+		safe_r(wp+26),
+		safe_r(wp+28),
+		safe_r(wp+30));
+
+	i = 15;
+	do {
+		vdp_text_window(reg, 10, 20, 16*6, 248, i);
+		k = wait_key();
+		switch (k) {
+		case -1: return -1;
+		case TI_MENU: return 0;
+		case TI_R: return 0;
+		case TI_UP1: if (i == 4) i = 0; else if (i > 4) i--; break;
+		case TI_DOWN1: if (i < 4) i = 4; else if (i < 19) i++; break;
+		//case TI_LEFT1: if (*bank > 0) (*bank)--; break;
+		//case TI_RIGHT1: if (*bank < )
+		}
+
+	} while (k != TI_ENTER);
+	// pressed enter
+	if (i == 0)
+		*addr = pc;
+	else
+		*addr = safe_r(wp + (i-4)*2);
+	return i;
+}
+
 
 int debug_window(void)
 {
+	int addr, bank, line;
+	unsigned int offset;
+	struct list_segment *seg;
 
 debug_refresh:
+	addr = get_pc();
+	bank = get_cart_bank();
 	//printf("before debug %d\n", add_cyc(0));
-
+debug_refresh_window:
 	update_debug_window();
 	//printf("after debug %d saved=%d\n", add_cyc(0), saved_cyc);
-
-	unsigned int offset;
-	struct list_segment *seg = listing_search(get_pc(), &offset);
-	int line;
+	seg = listing_search(addr, &offset, bank);
 debug_redraw:
 	line = 14;
 
@@ -1166,10 +1338,13 @@ debug_redraw:
 
 		int k = wait_key();
 		//print_key(k);
-		if (k == -1) return -1; // quit
 		if (k == TI_MENU) {
-			if (main_menu() == -1) return -1; // quit
+			k = main_menu();
+		} else if (k == TI_R) {
+			k = reg_menu(&addr, &bank);
+			if (k != -1) goto debug_refresh_window;
 		}
+		if (k == -1) return -1; // quit
 
 		if (seg) {
 			switch (k) {
@@ -1211,24 +1386,36 @@ debug_redraw:
 				if (do_find(seg->src, &offset, &line))
 					goto debug_redraw;
 				break;
+			case TI_B:
+			case TI_DELETE: {
+				unsigned int off = step_lines(seg->src, seg->src_len, offset, line);
+				int pc, ba;
+
+				pc = get_line_pc(seg->src, off);
+				if (pc != -1) {
+					// search all segments to find the right bank
+					ba = get_line_bank(seg->src, off);
+					if (ba == -1 && pc > 0x6000 && pc < 0x8000) {
+						ba = get_cart_bank();
+					}
+					// breakpoint
+					printf("breakpoint pc=%04X bank=%d\n", pc, ba);
+					if (k == TI_DELETE) {
+						remove_breakpoint(pc, ba);
+					} else {
+						set_breakpoint(pc, ba, BREAKPOINT_TOGGLE);
+					}
+					draw_listing(seg, &offset, &line, 0);
+				}
+				break;
+				}
 			}
 		}
-		if (k == TI_B) {
-			unsigned int i, off = offset;
-			int pc;
-			for (i = 0; i < line; i++)
-				off = next_line(seg->src, seg->src_len, off);
-			pc = get_line_pc(seg->src, off);
-			if (pc != -1) {
-				// breakpoint
-				printf("breakpoint pc=%04X bank=%d\n", pc, seg->bank);
-				set_breakpoint(pc, seg->bank, BREAKPOINT_TOGGLE);
-				draw_listing(seg, &offset, &line, 0);
-			}
-		} else if (k == TI_5+TI_ADDFCTN) {
-			// F5 list breakpoints
-			if (show_breakpoints() == -1)
-				return -1;
+		if (k == TI_5+TI_ADDFCTN || k == TI_B+TI_ADDCTRL) {
+			// F5 or Ctrl-B list breakpoints
+			int i = breakpoints_menu(&addr, &bank);
+			if (i == -1) return -1;
+			if (i == 1) goto debug_refresh_window;
 		}
 	}
 	mute(0);

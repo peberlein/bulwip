@@ -182,7 +182,7 @@ void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight
 					0x00,0x38,0x44,0x44,0x44,0x3C,0x44,0x38, // g
 					0x40,0x58,0x64,0x44,0x44,0x44,0x44,0x00, // h
 					0x10,0x00,0x30,0x10,0x10,0x10,0x38,0x00, // i
-					0x08,0x00,0x18,0x08,0x08,0x48,0x30,0x00, // j
+					0x08,0x00,0x18,0x08,0x08,0x08,0x48,0x30, // j
 					0x40,0x48,0x50,0x60,0x50,0x48,0x44,0x00, // k
 					0x30,0x10,0x10,0x10,0x10,0x10,0x38,0x00, // l
 					0x00,0x68,0x54,0x54,0x54,0x44,0x44,0x00, // m
@@ -328,7 +328,8 @@ void vdp_window_scale(int scale)
 {
 	scale_w = 320 * scale;
 	scale_h = 240 * scale;
-	SDL_SetWindowSize(window, scale_w, scale_h);
+	if (window)
+		SDL_SetWindowSize(window, scale_w, scale_h);
 }
 
 void vdp_set_filter(void)
@@ -590,6 +591,14 @@ int vdp_update(void)
 
 			//fprintf(stderr, "key %d mod %x val %d row %d col=%d\n", key->keysym.scancode, mod, val, row, col);
 			if (k != -1) {
+				if (k != TI_SHIFT && k != TI_CTRL && k != TI_FCTN && kdn) {
+					// a non-modifier key pressed for ui
+					set_ui_key(k & (TI_ADDCTRL | TI_ADDFCTN | TI_ADDSHIFT) ?
+						k : // already has modifiers
+						k | (mod & KMOD_CTRL ? TI_ADDCTRL : 0)
+						  | (mod & KMOD_ALT ? TI_ADDFCTN : 0)
+						  | (mod & KMOD_SHIFT ? TI_ADDSHIFT : 0));
+				}
 				if (k == TI_SHIFT) {
 					// modifier key changed, clear any modifiable keys
 					set_key(kdn ? TI_R : TI_G, 0);
@@ -669,7 +678,7 @@ int vdp_update(void)
 		}
 #endif
 		if (debug_en) {
-			SDL_Rect rect = {.x = 0, .y = 0, .w = 320, .h = 240};
+			SDL_Rect rect = {.x = 0, .y = 0, .w = scale_w/2, .h = scale_h/2};
 			SDL_RenderClear(renderer);
 			SDL_RenderCopy(renderer, debug_texture, NULL, NULL);
 			SDL_RenderCopy(renderer, texture, &src, &rect);
