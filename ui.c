@@ -168,8 +168,8 @@ static int line_len(const char *lst, unsigned int offset)
 	return len;
 }
 
-
-
+// Get a PC, which must be column 5 or 6 (starting at 0)
+// May have optional line number (or bank num) before it
 int get_line_pc(const char *lst, unsigned int offset)
 {
 	unsigned int i = offset, n = 0;
@@ -517,7 +517,7 @@ static int fps_menu(void)
 		"====================\n";
 	static int sel = 1;
 	int w = 20, h = 8;
-	
+
 	while (1) {
 		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, SHADOW);
 		vdp_text_window(menu, w,h, MENU_X,MENU_Y, sel);
@@ -586,7 +586,7 @@ static int crt_filter_menu(void)
 		"=====================\n";
 	int sel = config_crt_filter+1;
 	int w = 21, h = 8;
-	
+
 	while (1) {
 		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, SHADOW);
 		vdp_text_window(menu, w,h, MENU_X,MENU_Y, sel);
@@ -615,7 +615,7 @@ static int settings_menu(void)
 		"====================\n";
 	int sel = 1;
 	int w = 20, h = 5;
-	
+
 	while (1) {
 		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, SHADOW);
 		vdp_text_window(menu, w,h, MENU_X,MENU_Y, sel);
@@ -1066,7 +1066,7 @@ static int text_entry(char *title, char **stack)
 				int len;
 				offset = prev_line(*stack, strlen(*stack), offset);
 
-				
+
 
 			}
 		} else if (k == TI_S+TI_ADDFCTN || k == TI_DOWN1) {
@@ -1226,35 +1226,30 @@ static void print_key(int k)
 // TODO Change bank with left/right
 static int reg_menu(int *addr, int *bank)
 {
-	char reg[21*10]; // 20 lines of up to 10
+	char reg[16*11]; // 16 lines of up to 11
+	char rpc[10]; // just pc
 	int i = 12;
 	int pc = get_pc(), wp = get_wp();
 	int k;
 
+	sprintf(rpc, "PC: %04X\n", pc);
 	sprintf(reg,
-	        "PC: %04X\n"
-		"WP: %04X\n"
-		"ST: %04X\n"
-		"\n"
-		"R 0: %04X\n"
-		"R 1: %04X\n"
-		"R 2: %04X\n"
-		"R 3: %04X\n"
-		"R 4: %04X\n"
-		"R 5: %04X\n"
-		"R 6: %04X\n"
-		"R 7: %04X\n"
-		"R 8: %04X\n"
-		"R 9: %04X\n"
+		" R0: %04X\n"
+		" R1: %04X\n"
+		" R2: %04X\n"
+		" R3: %04X\n"
+		" R4: %04X\n"
+		" R5: %04X\n"
+		" R6: %04X\n"
+		" R7: %04X\n"
+		" R8: %04X\n"
+		" R9: %04X\n"
 		"R10: %04X\n"
 		"R11: %04X\n"
 		"R12: %04X\n"
 		"R13: %04X\n"
 		"R14: %04X\n"
 		"R15: %04X\n",
-		pc,
-		wp,
-		get_st(),
 		safe_r(wp),
 		safe_r(wp+2),
 		safe_r(wp+4),
@@ -1272,27 +1267,28 @@ static int reg_menu(int *addr, int *bank)
 		safe_r(wp+28),
 		safe_r(wp+30));
 
-	i = 15;
+	i = 11;
 	do {
-		vdp_text_window(reg, 10, 20, 16*6, 248, i);
+		vdp_text_window(rpc, 9, 1, 1*6, 248, i==-1 ? 0 : -1);
+		vdp_text_window(reg, 9, 16, 12*6, 248, i);
 		k = wait_key();
 		switch (k) {
 		case -1: return -1;
 		case TI_MENU: return 0;
 		case TI_R: return 0;
-		case TI_UP1: if (i == 4) i = 0; else if (i > 4) i--; break;
-		case TI_DOWN1: if (i < 4) i = 4; else if (i < 19) i++; break;
+		case TI_UP1: if (i > -1) i--; break;
+		case TI_DOWN1: if (i < 15) i++; break;
 		//case TI_LEFT1: if (*bank > 0) (*bank)--; break;
 		//case TI_RIGHT1: if (*bank < )
 		}
 
 	} while (k != TI_ENTER);
 	// pressed enter
-	if (i == 0)
+	if (i == -1)
 		*addr = pc;
 	else
-		*addr = safe_r(wp + (i-4)*2);
-	return i;
+		*addr = safe_r(wp + i*2);
+	return 0;
 }
 
 

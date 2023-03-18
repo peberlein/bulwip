@@ -41,24 +41,12 @@
 
 #include "cpu.h"
 
-#ifdef TEST
-// use compiled roms to avoid I/O
-#define COMPILED_ROMS
-#define ENABLE_GIF
-#else
-#define USE_SDL
-#endif
 
 #ifdef ENABLE_GIF
 #include "gif/gif.h"
 static GifWriter gif;
 #endif
 
-
-//#define TRACE_GROM
-//#define TRACE_VDP
-//#define TRACE_CPU
-//#define COMPILED_ROMS
 
 
 #ifdef COMPILED_ROMS
@@ -104,27 +92,6 @@ static char* my_strdup(const char *p)
 #endif
 }
 
-static char asm_text[80] = "";
-
-int print_asm(const char *fmt, ...)
-{
-	if (0) {
-		va_list ap;
-		int len = strlen(asm_text);
-		va_start(ap, fmt);
-		vsnprintf(asm_text+len, sizeof(asm_text)-len, fmt, ap);
-		va_end(ap);
-	}
-	if (!disasmf) return 0;
-	{
-		va_list ap;
-		va_start(ap, fmt);
-		int ret = vfprintf(disasmf, fmt, ap);
-		va_end(ap);
-		return ret;
-	}
-}
-
 
 
 static u16 tms9901_int_mask = 0; // 9901 interrupt mask
@@ -140,11 +107,13 @@ static u16 fast_ram[128] = {}; // 256 bytes at 8000-80ff,repeated at 8100,8200,8
 static u16 *ram = NULL; // 32k RAM or SAMS
 static unsigned int ram_size = 0; // in bytes
 
+char *cartridge_name = NULL;
 static u16 *cart_rom = NULL;
 static unsigned int cart_rom_size = 0;
 static u8 *cart_grom = NULL;
 static unsigned int cart_grom_size = 0;
 static u16 cart_bank_mask = 0;
+static u16 cart_bank = 0;
 
 static u16 *rom = NULL;
 static unsigned int rom_size = 0;
@@ -154,9 +123,15 @@ static unsigned int grom_size = 0;
 static u8 grom_latch = 0, grom_last = 0x00;
 static u16 ga; // grom address
 
+// keyboard and CRU
+u8 keyboard[8] = {0};
+static u8 keyboard_row = 0;
+static u8 timer_mode = 0;
+static u8 alpha_lock = 0;
+static unsigned int total_cycles = 0;
 
 #define VDP_RAM_SIZE (16*1024)
-static struct {
+static struct vdp {
 	u8 ram[VDP_RAM_SIZE];
 	u16 a; // address
 	u8 latch;
@@ -522,14 +497,12 @@ static void dsr_rom_w(u16 address, u16 value)
  * 6000-7FFF  Cartridge ROM/RAM         *
  ****************************************/
 
-static u16 cart_bank = 0;
-
 static void set_cart_bank(u16 bank)
 {
 	// 8K banking
 	cart_bank = bank & cart_bank_mask;
 	u16 *base = cart_rom + cart_bank * 4096/*words per 8KB bank*/;
-	//printf("%s: address=%04X bank=%d\n", __func__, bank, cart_bank);
+	printf("%s: address=%04X bank=%d\n", __func__, bank, cart_bank);
 	change_mapping(0x6000, 0x2000, base);
 }
 
@@ -576,7 +549,7 @@ static void mem_init(void)
 	set_mapping(0x0000, 0x2000, rom_r, zero_w, NULL);
 
 	// low memory expansion 2000-3fff
-	set_mapping(0x2000, 0x2000, map_r, map_w, ram+(0x0000/2));
+	set_mapping(0x2000, 0x2000, map_r, map_w, ram);
 
 	// DSR ROM 4000-5fff
 	set_mapping(0x4000, 0x2000, zero_r, zero_w, NULL);
@@ -606,21 +579,12 @@ static void mem_init(void)
  * Keyboard                             *
  ****************************************/
 
-// 0-7 unshifted keys 8-15 shifted keys 16-23 function keys
-u8 keyboard[8] = {0};
-static u8 keyboard_row = 0;
-static u8 timer_mode = 0;
-static unsigned int total_cycles = 0;
-static u8 alpha_lock = 0;
-
 void set_key(int key, int val)
 {
 	int row = (key >> 3) & 7, col = key & 7, mask = val << col;
 	keyboard[row] = (keyboard[row] & ~(1 << col)) | mask;
 	//alpha_lock = !!(key & TI_ALPHALOCK); // FIXME
 }
-
-
 
 void reset_ti_keys(void)
 {
@@ -1658,7 +1622,7 @@ int get_breakpoint(int address, int bank)
 void set_cart_name(char *name)
 {
 	free(cartridge_name);
-	cartridge_name = name;
+	cartridge_name = my_strdup(name);
 }
 
 // for ui.c:listing_search() in the debugger
@@ -1716,8 +1680,16 @@ void reset(void)
 		if (cart_rom) {
 			unsigned int banks = (cart_rom_size + 0x1fff) >> 13;
 
-			cart_bank_mask = banks ? (1 << (31-__builtin_clz(banks))) - 1 : 0;
-			printf("cart_bank_mask = 0x%x  (size=%d banks=%d) page_size=%d\n",
+			// get next power of 2
+			//cart_bank_mask = banks ? (1 << (32-__builtin_clz(banks))) - 1 : 0;
+			cart_bank_mask = banks-1;
+			cart_bank_mask |= cart_bank_mask >> 1;
+			cart_bank_mask |= cart_bank_mask >> 2;
+			cart_bank_mask |= cart_bank_mask >> 4;
+			cart_bank_mask |= cart_bank_mask >> 8;
+			cart_bank_mask |= cart_bank_mask >> 16;
+
+			printf("cart_bank_mask = 0x%x (size=%d banks=%d) page_size=%d\n",
 				cart_bank_mask, cart_rom_size, banks, 256/*1<<MAP_SHIFT*/);
 			set_cart_bank(0);
 		}
@@ -1787,8 +1759,6 @@ void update_debug_window(void)
 
 	pc = get_pc();
 	wp = get_wp();
-	memset(asm_text, 0, sizeof(asm_text));
-	disasm(pc);
 
 	if(0) {sprintf((char*)reg,
 	      "\n  VDP0: %02X  VDP: %04X      R0: %04X   R8:  %04X\n"
@@ -1800,7 +1770,7 @@ void update_debug_window(void)
 		"  VDP6: %02X                 R6: %04X   R14: %04X\n"
 		"  VDP7: %02X                 R7: %04X   R15: %04X\n"
 		"  KB: %02X %02X %02X %02X %02X %02X %02X %02X\n\n"
-		"%s\n                                          \n",
+		"\n                                          \n",
 		vdp.reg[0], vdp.a, safe_r(wp), safe_r(wp+16),
 		vdp.reg[1], vdp.reg[8], safe_r(wp+2), safe_r(wp+18),
 		vdp.reg[2], safe_r(wp+4), safe_r(wp+20),
@@ -1810,53 +1780,45 @@ void update_debug_window(void)
 		vdp.reg[6], safe_r(wp+12), safe_r(wp+28),
 		vdp.reg[7], safe_r(wp+14), safe_r(wp+30),
 		keyboard[0], keyboard[1], keyboard[2], keyboard[3],
-		keyboard[4], keyboard[5], keyboard[6], keyboard[7],
-		asm_text);
+		keyboard[4], keyboard[5], keyboard[6], keyboard[7]);
 	vdp_text_window(reg, 53, 30, 320, 0, -1);
 	} else {
 		sprintf((char*)reg,
-	      "\n  VDP0: %02X   PC: %04X\n"
-		"  VDP1: %02X   WP: %04X\n"
-		"  VDP2: %02X   ST: %04X\n"
-		"  VDP3: %02X          \n"
-		"  VDP4: %02X   R0: %04X\n"
-		"  VDP5: %02X   R1: %04X\n"
-		"  VDP6: %02X   R2: %04X\n"
-		"  VDP7: %02X   R3: %04X\n"
-		" VDP: %04X   R4: %04X\n"
-		" VDPST: %02X   R5: %04X\n"
-		"  Y: %-3d     R6: %04X\n"
-		" BANK: %-4d  R7: %04X\n"
-		"             R8: %04X\n"
-		"             R9: %04X\n"
-		"            R10: %04X\n"
-		"            R11: %04X\n"
-		"            R12: %04X\n"
-		"            R13: %04X\n"
-		"            R14: %04X\n"
-		"            R15: %04X\n"
+	      "\n PC: %04X    R0: %04X\n"
+		" WP: %04X    R1: %04X\n"
+		" ST: %04X    R2: %04X\n"
+		"             R3: %04X\n"
+		" VDP0: %02X    R4: %04X\n"
+		" VDP1: %02X    R5: %04X\n"
+		" VDP2: %02X    R6: %04X\n"
+		" VDP3: %02X    R7: %04X\n"
+		" VDP4: %02X    R8: %04X\n"
+		" VDP5: %02X    R9: %04X\n"
+		" VDP6: %02X   R10: %04X\n"
+		" VDP7: %02X   R11: %04X\n"
+		" VDP: %04X  R12: %04X\n"
+		" VDPST: %02X  R13: %04X\n"
+		"  Y: %-3d    R14: %04X\n"
+		" BANK: %-4d R15: %04X\n"
+		"            \n"
 		" KB: ROW: %d\n"
 		"%02X %02X %02X %02X %02X %02X %02X %02X\n\n",
-		vdp.reg[0], pc,
-		vdp.reg[1], wp,
-		vdp.reg[2], get_st(),
-		vdp.reg[3],
-		vdp.reg[4], safe_r(wp),
-		vdp.reg[5], safe_r(wp+2),
-		vdp.reg[6], safe_r(wp+4),
-		vdp.reg[7], safe_r(wp+6),
-		vdp.a,      safe_r(wp+8),
-		vdp.reg[8], safe_r(wp+10),
-		vdp.y,	    safe_r(wp+12),
-		cart_bank,  safe_r(wp+14),
-			    safe_r(wp+16),
-			    safe_r(wp+18),
-			    safe_r(wp+20),
-			    safe_r(wp+22),
-			    safe_r(wp+24),
-			    safe_r(wp+26),
-			    safe_r(wp+28),
-			    safe_r(wp+30),
+		pc,         safe_r(wp),
+		wp,         safe_r(wp+2),
+		get_st(),   safe_r(wp+4),
+		            safe_r(wp+6),
+		vdp.reg[0], safe_r(wp+8),
+		vdp.reg[1], safe_r(wp+10),
+		vdp.reg[2], safe_r(wp+12),
+		vdp.reg[3], safe_r(wp+14),
+		vdp.reg[4], safe_r(wp+16),
+		vdp.reg[5], safe_r(wp+18),
+		vdp.reg[6], safe_r(wp+20),
+		vdp.reg[7], safe_r(wp+22),
+		vdp.a,      safe_r(wp+24),
+		vdp.reg[8], safe_r(wp+26),
+		vdp.y,	    safe_r(wp+28),
+		cart_bank,  safe_r(wp+30),
 		keyboard_row,
 		keyboard[0], keyboard[1], keyboard[2], keyboard[3],
 		keyboard[4], keyboard[5], keyboard[6], keyboard[7]);
@@ -1933,7 +1895,7 @@ int main(int argc, char *argv[])
 	vdp_text_pat(grom + 0x06B4 - 32*7);
 
 	if (argc > 1) {
-		set_cart_name(my_strdup(argv[1])); // will get loaded on reset
+		set_cart_name(argv[1]); // will get loaded on reset
 		//load_rom(argv[1], &cart_rom, &cart_rom_size);
 		argv++;
 	} else {

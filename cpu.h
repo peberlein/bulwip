@@ -11,12 +11,29 @@ typedef signed char s8;
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 #endif
 
+#define ENABLE_UNDO
+
+#ifdef TEST
+// use compiled roms to avoid I/O
+#define COMPILED_ROMS
+#define ENABLE_GIF
+#else
+#define USE_SDL
+#endif
+
+// none of these are used yet
+//#define COMPILED_ROMS
+//#define TRACE_GROM
+//#define TRACE_VDP
+//#define TRACE_CPU
+
 
 // cpu.c
 extern void cpu_reset(void);
 extern void emu(void);
 extern void single_step(void);
 extern int disasm(u16 pc);
+extern char asm_text[80]; // output from disasm()
 extern int disasm_cyc; // cpu.c
 extern void interrupt(int level);
 
@@ -24,6 +41,7 @@ extern u16 get_pc(void);
 extern u16 get_wp(void);
 extern u16 get_st(void);
 extern int add_cyc(int add);
+
 //extern void cpu_break(int en);
 
 extern void change_mapping(int base, int size, u16 *mem);
@@ -45,6 +63,7 @@ extern void map_w(u16 address, u16 value);
 
 extern void cpu_reset_breakpoints(void); // clear all
 extern void cpu_set_breakpoint(u16 base, u16 size);
+
 
 
 
@@ -94,7 +113,6 @@ enum {
 extern int debug_break; // 0=running 1=pause 2=single step 3=frame step
 extern int config_crt_filter; // 0=smooth 1=pixelated 2=crt
 extern int debug_log(const char *fmt, ...);
-extern int print_asm(const char *fmt, ...);
 
 extern int breakpoint_read(u16 address); // called from brk_r()
 extern int breakpoint_write(u16 address); // called from brk_w()
