@@ -433,6 +433,18 @@ int vdp_update(void)
 	while (SDL_PollEvent(&event)) {
 		if (event.type == SDL_QUIT) {
 			return -1;
+		//} else if (event.type == SDL_KEY) {
+		} else if (event.type == SDL_WINDOWEVENT) {
+			if (event.window.event == SDL_WINDOWEVENT_RESIZED ||
+			    event.window.event == SDL_WINDOWEVENT_RESIZED) {
+				printf("window event %d %d\n", event.window.data1, event.window.data2);
+				scale_w = event.window.data1;
+				scale_h = event.window.data2;
+			}
+		} else if (event.type == SDL_DROPFILE) {
+			set_cart_name(event.drop.file);
+			reset();
+
 		} else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
 			SDL_KeyboardEvent *key = &event.key;
 			Uint16 mod = key->keysym.mod;
