@@ -23,6 +23,7 @@ Loading Cartridges:
 - Files ending in G.BIN are assumed to be GROM, otherwise ROM.
 - ROM files must be non-inverted (first bank is 0) format.
 - Listing file is loaded automatically and must be named the same as the ROM with a .LST extension.
+- Cartridge files may be loaded by drag-n-drop onto window.
 
 While debugger is open:
 - F1: Run/Stop
@@ -33,12 +34,16 @@ While debugger is open:
 - Ctrl-F: Find text string
 - Ctrl-G: Repeat last find
 - Shift-Ctrl-G: Repeat last find, reverse direction
-- B: Toggle breakpoint at current line
+- B: Toggle breakpoint at current line (red=stop, green=go)
 - Del: Remove breakpoint at current line
 - F5: List breakpoints
   - Enter: Go to selected breakpoint
   - Space: Toggle selected breakpoint
   - Del: Remove selected breakpoint
+- R: Register select, then Enter to jump to address
+- Z: Reverse instruction step
+- Shift-Z: Reverse instruction step until PC goes lower (good for rewinding out of a loop)
+- W: Redraw VDP screen (normally current scanline rendered)
 - TODO Ctrl->B: Go to referenced label
 
 
