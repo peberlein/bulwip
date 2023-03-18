@@ -143,6 +143,42 @@ extern void set_cart_name(char *name);
 extern int get_cart_bank(void);
 extern void paste_text(char *text, int old_fps);
 
+// Each undo operation is 32-bits, encoded as:
+enum {
+	UNDO_PC = 0x0000, // 0x0000 <PC:16>   
+	UNDO_WP = 0x0001, // 0x0001 <WP:16>
+	UNDO_ST = 0x0002, // 0x0002 <ST:16>
+	UNDO_CYC= 0x0003, // 0x0003 <Cyc:16>
+
+	UNDO_VDPA = 0x0004, // 0x0004 <VdpAddr:16>
+	UNDO_VDPD = 0x0005, // 0x0005 <VdpData:8>
+	UNDO_VDPL = 0x0006, // 0x0006 <VdpLatch:1>
+	UNDO_VDPST = 0x0007, // 0x0007 <VdpStatus:16>
+	UNDO_VDPY = 0x0008, // 0x0008 <VdpY:16>
+	UNDO_VDPR = 0x0009, // 0x0009 <VdpReg:8> <Value:8>
+
+	UNDO_GA = 0x000a, // 0x000a <GromAddr:16>
+	UNDO_GD = 0x000b, // 0x000b <GromData:8>
+	UNDO_GL = 0x000c, // 0x000c <GromLatch:1>
+	UNDO_CB = 0x000d, // 0x000d <CartBank:16>
+
+	UNDO_KB = 0x000e, // 0x000e <KeyboardLine:3>
+
+	UNDO_CPURAM = 0x0080, // 0x00 0b1 <FastRamAddr:7> <Value:16>
+	UNDO_VDPRAM = 0x1000, // 0b0001   <VDPRamAddr:12> <Value:8>
+		// 0b001
+	UNDO_EXPRAM = 0x4000, // 0b01 <ExpRamAddr:14> <Value:16>
+		// 0b1 
+};
+
+#ifdef ENABLE_UNDO
+extern int undo_pop(void);
+extern void undo_push(u16 op, unsigned int value);
+extern void undo_pcs(u16 *pcs, u8 *cycs, int count);
+#else
+// static definitions to turn into no-ops
+static void undo_push(u16 op, unsigned int value) { }
+#endif
 
 
 //          col

@@ -1300,12 +1300,45 @@ static int reg_menu(int *addr, int *bank)
 	return 0;
 }
 
+static unsigned int fill_seg_from_disasm(struct list_segment *seg, int pc)
+{
+	unsigned int offset;
+	int i, len = 0;
+	char *txt = (char*) seg->src;
+#ifdef ENABLE_UNDO
+	u16 pcs[1024] = {0};
+	u8 cycs[ARRAY_SIZE(pcs)];
+
+	undo_pcs(pcs, cycs, ARRAY_SIZE(pcs));
+	seg->src_len = 0;
+	for (i = ARRAY_SIZE(pcs)-1; i >= 0; i--) {
+		disasm(pcs[i]);
+		int len = strlen(asm_text);
+
+		txt = realloc(txt, seg->src_len + len + 1);
+		strcpy(txt + seg->src_len, asm_text);
+		seg->src_len += len;
+	}
+#endif
+	offset = seg->src_len;
+	for (i = 0; i < 1024; i++) {
+		pc += disasm(pc);
+		int len = strlen(asm_text);
+
+		txt = realloc(txt, seg->src_len + len + 1);
+		strcpy(txt + seg->src_len, asm_text);
+		seg->src_len += len;
+	}
+	seg->src = txt;
+	return offset;
+}
 
 int debug_window(void)
 {
 	int addr, bank, line;
 	unsigned int offset;
 	struct list_segment *seg;
+	struct list_segment asm_seg = {};
 
 debug_refresh:
 	addr = get_pc();
@@ -1315,6 +1348,10 @@ debug_refresh_window:
 	update_debug_window();
 	//printf("after debug %d saved=%d\n", add_cyc(0), saved_cyc);
 	seg = listing_search(addr, &offset, bank);
+	if (!seg) {
+		seg = &asm_seg;
+		offset = fill_seg_from_disasm(seg, addr);
+	}
 debug_redraw:
 	line = 14;
 
@@ -1338,6 +1375,7 @@ debug_redraw:
 
 			single_step();
 			debug_break = DEBUG_STOP;
+			redraw_vdp();
 			goto debug_refresh;
 		}
 
@@ -1397,6 +1435,7 @@ debug_redraw:
 				int pc, ba;
 
 				pc = get_line_pc(seg->src, off);
+				printf("b off=%d pc=%04x\n", off, pc);
 				if (pc != -1) {
 					// search all segments to find the right bank
 					ba = get_line_bank(seg->src, off);
@@ -1421,6 +1460,22 @@ debug_redraw:
 			int i = breakpoints_menu(&addr, &bank);
 			if (i == -1) return -1;
 			if (i == 1) goto debug_refresh_window;
+#ifdef ENABLE_UNDO
+		} else if (k == TI_Z+TI_ADDSHIFT) {
+			u16 a = addr;
+			do {
+				if (undo_pop()) break;
+			} while (get_pc() >= a);
+			redraw_vdp();
+			goto debug_refresh;
+		} else if (k == TI_Z) {
+			if (undo_pop() == 0) {
+				redraw_vdp();
+				goto debug_refresh;
+			}
+#endif
+		} else if (k == TI_W) {
+			redraw_vdp();
 		}
 	}
 	mute(0);

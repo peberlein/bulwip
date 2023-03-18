@@ -71,6 +71,13 @@ u16 get_wp(void) { return gWP; }
 u16 get_st(void); // defined below with status functions
 int add_cyc(int add) { cyc += add; return cyc; }
 
+// needed by undo stack
+void set_pc(u16 pc) { gPC = pc; }
+void set_wp(u16 wp) { gWP = wp; }
+void set_st(u16); // defined below with status functions
+void set_cyc(s16 c) { cyc = c; }
+
+
 #if 0
 // Setting en will allow the next emu() to return after a single instruction
 // Clearing en will restore the number of saved cycles before returning
@@ -95,6 +102,8 @@ void single_step(void)
 	cyc += saved_cyc;
 	//printf("%s: save=%d cyc=%d\n", __func__, saved_cyc, cyc);
 }
+
+
 
 
 
@@ -254,6 +263,7 @@ void map_w(u16 address, u16 value)
 		debug_log("no memory mapped at %04X (write, %04X)\n", address, value);
 		return;
 	}
+	// undo_push(UNDO_EXPRAM, )  FIXME how to do this?
 	map_mem(page)[offset >> 1] = value;
 }
 
@@ -329,7 +339,7 @@ static u8 st_int = 0; // status register interrupt mask
 
 
 u16 get_st(void) { return ((u16)st_flg << 8) | st_int; }
-static always_inline void set_st(u16 new_st) { st_flg = new_st >> 8; st_int = new_st & ST_IM; }
+void set_st(u16 new_st) { st_flg = new_st >> 8; st_int = new_st & ST_IM; }
 static always_inline void set_C (void) { st_flg |= ST_C; }
 static always_inline void clr_C (void) { st_flg &= ~ST_C; }
 static always_inline void set_OV(void) { st_flg |= ST_OV; }
@@ -739,6 +749,10 @@ start_decoding:
 #ifdef LOG_DISASM
 	start_cyc = cyc;
 #endif
+	undo_push(UNDO_PC, pc);
+	undo_push(UNDO_CYC, (u16)cyc);
+	undo_push(UNDO_ST, get_st());
+
 	op = mem_r(pc);
 #ifdef ENABLE_TRACE
 	tracer->pc = pc;
@@ -1006,6 +1020,7 @@ execute_op:
 		struct val_addr td;
 		switch ((op >> 6) & 15) {
 		case 0: BLWP:
+			undo_push(UNDO_WP, wp);
 			td = Td(op, &pc, wp);
 			//debug_log("OLD pc=%04X wp=%04X st=%04X  NEW pc=%04X wp=%04X\n", pc, wp, st, safe_r(va.addr+2), va.val);
 			mem_w(td.val + 2*13, wp);
@@ -1058,12 +1073,12 @@ execute_op:
 		case 4: CI: status_arith(reg_r(wp, reg), mem_r(pc)); pc += 2; goto decode_op;
 		case 5: STWP: reg_w(wp, reg, wp); goto decode_op;
 		case 6: STST: reg_w(wp, reg, get_st()); goto decode_op;
-		case 7: LWPI: wp = mem_r(pc); pc += 2; goto decode_op;
+		case 7: LWPI: undo_push(UNDO_WP, wp); wp = mem_r(pc); pc += 2; goto decode_op;
 		case 8: LIMI: set_IM(mem_r(pc) & 15); pc += 2; gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
 		case 9: goto UNHANDLED;
 		case 10: IDLE: debug_log("IDLE not implemented\n");/* TODO */ goto decode_op;
 		case 11: RSET: debug_log("RSET not implemented\n"); /* TODO */ goto decode_op;
-		case 12: RTWP: set_st(reg_r(wp, 15)); pc = reg_r(wp, 14); wp = reg_r(wp, 13); gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
+		case 12: RTWP: undo_push(UNDO_WP, wp); set_st(reg_r(wp, 15)); pc = reg_r(wp, 14); wp = reg_r(wp, 13); gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
 		case 13: CKON: debug_log("CKON not implemented\n");/* TODO */ goto decode_op;
 		case 14: CKOF: debug_log("CKOF not implemented\n");/* TODO */ goto decode_op;
 		case 15: LREX: debug_log("LREX not implemented\n");/* TODO */ goto decode_op;
@@ -1103,32 +1118,35 @@ static const char **names[] = {
 };
 
 
-char disbuf[64] = {};
+static char reg_text[64] = {};
+char asm_text[80] = {};
+
+
 static u16 disasm_Ts(u16 pc, u16 op, int opsize)
 {
 	u16 i = op & 15;
 	switch ((op >> 4) & 3) {
 	case 0: // Rx
-		print_asm("R%d", i);
-		sprintf(disbuf+strlen(disbuf), " R%d=%04X", i, safe_r(gWP+i*2));
+		sprintf(asm_text+strlen(asm_text), "R%d", i);
+		sprintf(reg_text+strlen(reg_text), " R%d=%04X", i, safe_r(gWP+i*2));
 		break;
 	case 1: // *Rx
-		print_asm("*R%d", i);
-		sprintf(disbuf+strlen(disbuf), " *(R%d=%04X)=%04X ", i, safe_r(gWP+i*2), safe_r(safe_r(gWP+i*2)));
+		sprintf(asm_text+strlen(asm_text), "*R%d", i);
+		sprintf(reg_text+strlen(reg_text), " *(R%d=%04X)=%04X ", i, safe_r(gWP+i*2), safe_r(safe_r(gWP+i*2)));
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0
 		pc += 2;
-		print_asm("@>%04X", safe_r(pc));
+		sprintf(asm_text+strlen(asm_text), "@>%04X", safe_r(pc));
 		if (i) {
-			print_asm("(R%d)", i);
-			sprintf(disbuf+strlen(disbuf), " @>%04X(R%d=%X)=%04X", safe_r(pc), i, safe_r(gWP+i*2), safe_r(safe_r(pc)+safe_r(gWP+i*2)));
+			sprintf(asm_text+strlen(asm_text), "(R%d)", i);
+			sprintf(reg_text+strlen(reg_text), " @>%04X(R%d=%X)=%04X", safe_r(pc), i, safe_r(gWP+i*2), safe_r(safe_r(pc)+safe_r(gWP+i*2)));
 		} else {
-			sprintf(disbuf+strlen(disbuf), " @>%04X=%04X", safe_r(pc), safe_r(safe_r(pc)));
+			sprintf(reg_text+strlen(reg_text), " @>%04X=%04X", safe_r(pc), safe_r(safe_r(pc)));
 		}
 		break;
 	case 3: // *Rx+
-		print_asm("*R%d+", i);
-		sprintf(disbuf+strlen(disbuf), " *(R%d=%04X)+=%04X", i,
+		sprintf(asm_text+strlen(asm_text), "*R%d+", i);
+		sprintf(reg_text+strlen(reg_text), " *(R%d=%04X)+=%04X", i,
 			safe_r(gWP+(op&15)*2) /*-opsize*/,    // subtracting opsize will undo the increment
 			safe_r(safe_r(gWP+(op&15)*2)/*-opsize*/)); // but only if disassembling after executing
 		break;
@@ -1141,26 +1159,26 @@ static u16 disasm_Bs(u16 pc, u16 op, int opsize)
 	u16 i = op & 15;
 	switch ((op >> 4) & 3) {
 	case 0: // Rx
-		print_asm("R%d", i);
-		sprintf(disbuf+strlen(disbuf), " R%d=%04X", i, safe_r(gWP+i*2));
+		sprintf(asm_text+strlen(asm_text), "R%d", i);
+		sprintf(reg_text+strlen(reg_text), " R%d=%04X", i, safe_r(gWP+i*2));
 		break;
 	case 1: // *Rx
-		print_asm("*R%d", i);
-		sprintf(disbuf+strlen(disbuf), " R%d=%04X", i, safe_r(gWP+i*2));
+		sprintf(asm_text+strlen(asm_text), "*R%d", i);
+		sprintf(reg_text+strlen(reg_text), " R%d=%04X", i, safe_r(gWP+i*2));
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0
 		pc += 2;
-		print_asm("@>%04X", safe_r(pc));
+		sprintf(asm_text+strlen(asm_text), "@>%04X", safe_r(pc));
 		if (i) {
-			print_asm("(R%d)", i);
-			sprintf(disbuf+strlen(disbuf), " @>%04X(R%d=%X)=%04X", safe_r(pc), i, safe_r(gWP+i*2), safe_r(safe_r(pc)+safe_r(gWP+i*2)));
+			sprintf(asm_text+strlen(asm_text), "(R%d)", i);
+			sprintf(reg_text+strlen(reg_text), " @>%04X(R%d=%X)=%04X", safe_r(pc), i, safe_r(gWP+i*2), safe_r(safe_r(pc)+safe_r(gWP+i*2)));
 		} else {
-			sprintf(disbuf+strlen(disbuf), " @>%04X=%04X", safe_r(pc), safe_r(safe_r(pc)));
+			sprintf(reg_text+strlen(reg_text), " @>%04X=%04X", safe_r(pc), safe_r(safe_r(pc)));
 		}
 		break;
 	case 3: // *Rx+
-		print_asm("*R%d+", i);
-		sprintf(disbuf+strlen(disbuf), " *R%d=%04X", i, safe_r(safe_r(gWP+(op&15)*2)-opsize));
+		sprintf(asm_text+strlen(asm_text), "*R%d+", i);
+		sprintf(reg_text+strlen(reg_text), " *R%d=%04X", i, safe_r(safe_r(gWP+(op&15)*2)-opsize));
 		break;
 	}
 	return pc;
@@ -1177,18 +1195,21 @@ int disasm(u16 pc)
 	static const int jt5[]={L4(SRA,SRL,SLA,SRC)};
 	static const int jt6[]={L8(BLWP,B,X,CLR,NEG,INV,INC,INCT),L8(DEC,DECT,BL,SWPB,SETO,ABS,BAD,BAD)};
 	static const int jt7[]={L8(LI,AI,ANDI,ORI,CI,STWP,STST,LWPI),L8(LIMI,BAD,IDLE,RSET,RTWP,CKON,CKOF,LREX)};
-	static const int * jt[] = {jt1, jt2, jt3, jt4, jt5, jt6, jt7};
+	static const int *jt[] = {jt1, jt2, jt3, jt4, jt5, jt6, jt7};
 	int save_cyc = cyc;
 	u16 wp = gWP;
 	u16 op = safe_r(pc), ts, td;
 	u8 idx = __builtin_clz(op)-16;
 	u16 start_pc = pc;
 
-	disbuf[0] = 0; // clear register value string
-	print_asm("%04X  %04X  ", pc, op);
+	asm_text[0] = 0; // clear the disassembly string
+	reg_text[0] = 0; // clear register value string
+	// note: for breakpoints to work, PC must be at column 5 or 6
+	sprintf(asm_text+strlen(asm_text), " %-3d %04X  %04X  ",
+		pc >= 0x6000 && pc < 0x8000 ? get_cart_bank() : 0, pc, op);
 	if (idx >= ARRAY_SIZE(jt)) {
 		BAD:
-		print_asm("DATA >%04X\n", op);
+		sprintf(asm_text+strlen(asm_text), "DATA >%04X\n", op);
 		cyc = save_cyc;
 		return 2;
 	}
@@ -1196,36 +1217,36 @@ int disasm(u16 pc)
 
 	if (!names[idx][subidx])
 		goto BAD;
-	print_asm("%-5s", names[idx][subidx]);
+	sprintf(asm_text+strlen(asm_text), "%-5s", names[idx][subidx]);
 	goto *(&&C + jt[idx][subidx]);
 
 C: A: MOV: SOC: SZC: S:
 	pc = disasm_Ts(pc, op, 2);
-	print_asm(",");
+	sprintf(asm_text+strlen(asm_text), ",");
 	pc = disasm_Ts(pc, op >> 6, 2);
 	goto done;
 
 CB: AB: MOVB: SOCB: SZCB: SB:
 	pc = disasm_Ts(pc, op, 1);
-	print_asm(",");
+	sprintf(asm_text+strlen(asm_text), ",");
 	pc = disasm_Ts(pc, op >> 6, 1);
 	goto done;
 COC: CZC: XOR: MPY: DIV:
 	pc = disasm_Ts(pc, op, 2);
-	print_asm(",R%d", (op >> 6) & 15);
+	sprintf(asm_text+strlen(asm_text), ",R%d", (op >> 6) & 15);
 	goto done;
 XOP:
 	pc = disasm_Ts(pc, op, 2);
-	print_asm(",%d", (op >> 6) & 15);
+	sprintf(asm_text+strlen(asm_text), ",%d", (op >> 6) & 15);
 	goto done;
 LDCR: STCR:
 	pc = disasm_Ts(pc, op, 2);
-	print_asm(",%d", (op >> 6) & 15 ?: 16);
+	sprintf(asm_text+strlen(asm_text), ",%d", (op >> 6) & 15 ?: 16);
 	goto done;
 
 JMP: JLT: JLE: JEQ: JHE: JGT: JNE: JNC: JOC: JNO: JL: JH: JOP:
-	print_asm(">%04X", pc + 2 + 2 * (s8)(op & 0xff));
-	sprintf(disbuf, "ST=%s%s%s%s%s",
+	sprintf(asm_text+strlen(asm_text), ">%04X", pc + 2 + 2 * (s8)(op & 0xff));
+	sprintf(reg_text, "ST=%s%s%s%s%s",
 		tst_EQ() ? "EQ " : "",
 		tst_GT() ? "A> " : "",
 		tst_H()&&tst_HE() ? "L> " : "",
@@ -1233,11 +1254,11 @@ JMP: JLT: JLE: JEQ: JHE: JGT: JNE: JNC: JOC: JNO: JL: JH: JOP:
 		tst_OV() ? "OV " : "");
 	goto done;
 SBO: SBZ: TB:
-	print_asm("%d", op & 0xff);
+	sprintf(asm_text+strlen(asm_text), "%d", op & 0xff);
 	goto done;
 SRA: SRL: SLA: SRC:
-	print_asm("R%d,", op & 15);
-	print_asm((op & 0x00f0) ? "%d" : "R0", (op >> 4) & 15);
+	sprintf(asm_text+strlen(asm_text), "R%d,", op & 15);
+	sprintf(asm_text+strlen(asm_text), (op & 0x00f0) ? "%d" : "R0", (op >> 4) & 15);
 	goto done;
 BLWP: B: BL:
 	pc = disasm_Bs(pc, op, 2);
@@ -1246,32 +1267,34 @@ X: CLR: NEG: INV: INC: INCT: DEC: DECT: SWPB: SETO: ABS:
 	pc = disasm_Ts(pc, op, 2);
 	goto done;
 LI: AI: ANDI: ORI: CI:
-	sprintf(disbuf, "R%d=%04X",
+	sprintf(reg_text, "R%d=%04X",
 		op & 15, safe_r(wp + (op & 15)*2));
 	pc += 2;
-	print_asm("R%d,>%04X", op & 15, safe_r(pc));
+	sprintf(asm_text+strlen(asm_text), "R%d,>%04X", op & 15, safe_r(pc));
 	goto done;
 STWP: STST:
-	print_asm("R%d", op & 15);
+	sprintf(asm_text+strlen(asm_text), "R%d", op & 15);
 	goto done;
 IDLE: RSET: RTWP: CKON: CKOF: LREX:
 	goto done;
 LWPI: LIMI:
 	pc += 2;
-	print_asm(">%04X", safe_r(pc));
+	sprintf(asm_text+strlen(asm_text), ">%04X", safe_r(pc));
 	goto done;
 
 done:
-	//print_asm("\n");
-	//print_asm("\t\t%s\n", disbuf);
-	print_asm("\t\t(%d)\n", disasm_cyc);
-	int ret = pc - start_pc;
+	sprintf(asm_text+strlen(asm_text), "\n");
+	//sprintf(asm_text+strlen(asm_text), "\t\t%s\n", reg_text);
+	//sprintf(asm_text+strlen(asm_text), "\t\t(%d)\n", disasm_cyc);
+	int ret = pc+2 - start_pc;
 	while (start_pc != pc) {
 		start_pc += 2;
-		print_asm("      %04X\n", safe_r(start_pc));
+		sprintf(asm_text+strlen(asm_text), "           %04X\n", safe_r(start_pc));
 	}
 	cyc = save_cyc;
 	return ret;
 }
+
+
 
 

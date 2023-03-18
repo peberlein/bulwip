@@ -145,8 +145,131 @@ static struct vdp {
 	.y = 0,
 };
 
-char *cartridge_name = NULL;
+struct state {
+	u16 pc, wp, st;
+	u16 fast_ram[128];
+	u16 ram[32*1024/2];
+	u16 cart_bank;
+	u8 grom_latch, grom_last;
+	u16 ga;
+	u8 keyboard_row;
+	u8 timer_mode;
+	u8 alpha_lock;
+	struct vdp vdp;
+	int cyc;
+};
 
+struct state* save_state(void)
+{
+	struct state *s = malloc(sizeof(struct state));
+	s->pc = get_pc();
+	s->wp = get_wp();
+	s->st = get_st();
+	memcpy(s->fast_ram, fast_ram, sizeof(fast_ram));
+	memcpy(s->ram, ram, sizeof(s->ram));
+	s->cart_bank = cart_bank;
+	s->grom_latch = grom_latch;
+	s->grom_last = grom_last;
+	s->ga = ga;
+	s->keyboard_row = keyboard_row;
+	s->timer_mode = timer_mode;
+	s->alpha_lock = alpha_lock;
+	memcpy(&s->vdp, &vdp, sizeof(struct vdp));
+	s->cyc = add_cyc(0);
+	return s;
+}
+
+
+/******************************************
+ * Undo stack and encoding functions      *
+ ******************************************/
+
+
+#ifdef ENABLE_UNDO
+
+static unsigned int undo_buffer[1024*1024] = {};
+static unsigned int undo_head = 0, undo_tail = 0;
+
+int undo_pop(void)
+{
+	// cpu.c (undo access only!)
+	extern void set_pc(u16);
+	extern void set_wp(u16);
+	extern void set_st(u16);
+	extern void set_cyc(s16);
+
+	while (undo_head != undo_tail) {
+		if (undo_head-- == 0) { // wrap around
+			undo_head = ARRAY_SIZE(undo_buffer)-1;
+		}
+		unsigned int v = undo_buffer[undo_head];
+		unsigned int w = undo_buffer[undo_head] & 0xffff;
+		//printf("undo %04x %04x\n", v>>16, w);
+		switch (v >> 16) {
+		case UNDO_PC: set_pc(w); return 0;
+		case UNDO_WP: set_wp(w); break;
+		case UNDO_ST: set_st(w); break;
+		case UNDO_CYC: set_cyc(w); break;
+		case UNDO_VDPA: vdp.a = w; break;
+		case UNDO_VDPD: /* ??? */ break;
+		case UNDO_VDPL: vdp.latch = w & 1; break;
+		case UNDO_VDPST: vdp.reg[8] = w; break;
+		case UNDO_VDPY: vdp.y = w; break;
+		case UNDO_VDPR: vdp.reg[(w>>8)] = w&0xff; break;
+		case UNDO_GA: ga = w; break;
+		case UNDO_GD: grom_last = w; break;
+		case UNDO_GL: grom_latch = w&1; break;
+		case UNDO_CB: cart_bank = w; break;
+		case UNDO_KB: keyboard_row = w; break;
+		default:
+			if (((v>>16) & 0xc000) == UNDO_EXPRAM) {
+				ram[(v>>16) & 0x7fff] = w;
+			} else if (((v>>16) & 0xf000) == UNDO_VDPRAM) {
+				vdp.ram[(v>>8) & 0x3fff] = w&0xff;
+			} else if (((v>>16) & 0xff80) == UNDO_CPURAM) {
+				//printf("fast_ram[%02x]=%04x\n", (v>>16) & 0x7f, w);
+				fast_ram[(v>>16) & 0x7f] = w;
+			} else {
+				printf("unhandled undo %04x %04x\n", v>>16, w);
+			}
+			break;
+		}
+	}
+	printf("undo buffer exhausted - \n");
+	return -1;
+}
+
+void undo_pcs(u16 *pcs, u8 *cycs, int count)
+{
+	int idx = 0;
+	unsigned int i = undo_head;
+	while (i != undo_tail) {
+		if (i-- == 0) { // wrap around
+			i = ARRAY_SIZE(undo_buffer)-1;
+		}
+		unsigned int v = undo_buffer[i];
+		unsigned int w = undo_buffer[i] & 0xffff;
+		if ((v >> 16) == UNDO_PC) {
+			pcs[idx++] = w;
+			if (idx == count) break;
+		}
+	}
+}
+
+void undo_push(u16 op, unsigned int value)
+{
+	undo_buffer[undo_head] = (op << 16) | value;
+	if (++undo_head == ARRAY_SIZE(undo_buffer)) {
+		undo_head = 0; // wrap around
+	}
+	if (undo_tail == undo_head) {
+		if (++undo_tail == ARRAY_SIZE(undo_buffer)) {
+			undo_tail = 0; // wrap around
+		}
+	}
+}
+
+#endif
 
 
 
@@ -166,7 +289,9 @@ static void ram_8300_w(u16 address, u16 value)
 {
 	// fast RAM, incompletely decoded at 8000, 8100, 8200, 8300
 	add_cyc(2);
-	fast_ram[(address & 0xfe) >> 1] = value;
+	address = (address & 0xfe) >> 1;
+	undo_push(UNDO_CPURAM + address, fast_ram[address]);
+	fast_ram[address] = value;
 //		if (address == 0x8380) {
 //			debug_log("RAM write %04X = %04X\n", address & 0xfffe, value);
 //			dump_regs();
@@ -212,6 +337,7 @@ static u16 vdp_8800_r(u16 address)
 		// 8802   VDP RAM read status register
 		u16 value = vdp.reg[8] << 8;
 		//debug_log("VDP_STATUS=%0x\n", vdp.reg[8]);
+		undo_push(UNDO_VDPST, vdp.reg[8]);
 		vdp.reg[8] &= ~0xE0; // clear interrupt flags
 		interrupt(-1); // deassert INTREQ
 		return value;
@@ -267,11 +393,15 @@ static void vdp_8c00_w(u16 address, u16 value)
 	if (address == 0x8C00) {
 		// 8C00   VDP RAM write data register
 		//debug_log("VDP write %04X = %02X\n", vdp.a, value >> 8);
+		undo_push(UNDO_VDPA, vdp.a);
+		undo_push(UNDO_VDPRAM, (vdp.a << 8) | vdp.ram[vdp.a]);
 		vdp.ram[vdp.a] = value >> 8;
 		vdp.a = (vdp.a + 1) & 0x3fff; // wraps at 16K
 		return;
 	} else if (address == 0x8C02) {
 		// 8C02   VDP RAM write address register
+		undo_push(UNDO_VDPA, vdp.a);
+		undo_push(UNDO_VDPL, vdp.latch);
 		vdp.latch ^= 1;
 		if (vdp.latch) {
 			// first low byte 
@@ -280,6 +410,7 @@ static void vdp_8c00_w(u16 address, u16 value)
 			// second high byte
 			if (value & 0x8000) {
 				// register write
+				undo_push(UNDO_VDPR, (value & 0x700) | vdp.reg[(value >> 8) & 7]);
 				vdp.reg[(value >> 8) & 7] = vdp.a & 0xff;
 #ifdef TRACE_VDP
 				fprintf(stdout, "VDP register %X %02X at PC=%04X\n", (value >> 8) & 7, vdp.a & 0xff, get_pc());
@@ -380,10 +511,13 @@ static u16 grom_9800_r(u16 address)
 		// pc=77c  GET NEXT BYTE FROM GROM (2ND BYTE)
 
 		u16 value = grom_last << 8;
+		undo_push(UNDO_GD, grom_last);
 		grom_read();
+		undo_push(UNDO_GA, ga);
 		grom_address_increment();
 
 		add_cyc(25);
+		undo_push(UNDO_GL, grom_latch);
 		grom_latch = 0;
 
 		return value;
@@ -391,6 +525,8 @@ static u16 grom_9800_r(u16 address)
 		// grom read address (plus one) (first low byte, then high)
 		u16 value = (ga & 0xff00);
 		add_cyc(19);
+		undo_push(UNDO_GA, ga);
+		undo_push(UNDO_GL, grom_latch);
 		grom_latch = 0;
 		ga = (ga << 8) | (ga & 0x00ff);
 		//debug_log("%04X GROM addr read %04X\n", get_pc(), ga);
@@ -428,6 +564,8 @@ static void grom_9c00_w(u16 address, u16 value)
 		return;
 	} else if ((address & 3) == 2) {
 		// grom write address
+		undo_push(UNDO_GA, ga);
+		undo_push(UNDO_GL, grom_latch);
 		ga = ((ga << 8) & 0xff00) | (value >> 8);
 
 		grom_latch ^= 1;
@@ -438,6 +576,7 @@ static void grom_9c00_w(u16 address, u16 value)
 			// second
 			add_cyc(27);
 
+			undo_push(UNDO_GD, grom_last);
 			grom_read();
 			grom_address_increment();
 
@@ -508,6 +647,7 @@ static void set_cart_bank(u16 bank)
 
 static void cart_rom_w(u16 address, u16 value)
 {
+	undo_push(UNDO_CB, cart_bank);
 	set_cart_bank(address >> 1);
 	add_cyc(6); // 4 extra cycles for multiplexer
 	//debug_log("Cartridge ROM write %04X %04X\n", address, value);
@@ -760,6 +900,7 @@ void cru_w(u16 bit, u8 value)
 	case 18: //keyboard_row = (keyboard_row & ~1) | (value & 1); break;
 	case 19: //keyboard_row = (keyboard_row & ~2) | ((value & 1) << 1); break;
 	case 20: //keyboard_row = (keyboard_row & ~4) | ((value & 1) << 2); break;
+		undo_push(UNDO_KB, keyboard_row);
 		keyboard_row &= ~(1 << (bit-18));
 		keyboard_row |= (value & 1) << (bit-18);
 		break;
@@ -1648,6 +1789,11 @@ void reset(void)
  	ga = 0xb5b5; // grom address
 	grom_last = 0xaf;
 
+#ifdef ENABLE_UNDO
+	undo_head = 0; undo_tail = 0;
+#endif
+	cart_bank = 0;
+
 	// TODO reload cartridge images too
 	if (cartridge_name) {
 		unsigned int len = strlen(cartridge_name);
@@ -1944,10 +2090,12 @@ int main(int argc, char *argv[])
 			if (vdp.y < 240) {
 				vdp_line(vdp.y, vdp.reg, vdp.ram);
 			} else if (vdp.y == 246) {
+				undo_push(UNDO_VDPST, vdp.reg[8]);
 				vdp.reg[8] |= 0x80;  // set F in VDP status
 				if (vdp.reg[1] & 0x20) // check IE
 					interrupt(1);  // VDP interrupt
 			}
+			undo_push(UNDO_VDPY, vdp.y);
 			if (++vdp.y == lines_per_frame) {
 				vdp.y = 0;
 			}
