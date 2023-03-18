@@ -236,14 +236,16 @@ static struct list_segment *new_list_segment(const char *src, unsigned int len)
 
 static void remove_conflicting_segments(struct list_segment *seg)
 {
-	struct list_segment *tmp, **list;
-	for (list = &listings; *list; list = &(*list)->next) {
+	struct list_segment *tmp, **list = &listings;
+	while (*list) {
 		tmp = *list;
 		if (seg == tmp ||
 		    seg->end_addr <= tmp->start_addr ||
 		    seg->start_addr >= tmp->end_addr ||
-		    (seg->bank != tmp->bank && seg->bank != -1 && tmp->bank != -1))
+		    (seg->bank != tmp->bank && seg->bank != -1 && tmp->bank != -1)) {
+			list = &(*list)->next;
 			continue;
+		    }
 		// overlapping segment, remove it
 		printf("overlap %X..%X:%d and %X..%X:%d\n",
 			seg->start_addr, seg->end_addr, seg->bank,
@@ -349,8 +351,15 @@ void load_listing(const char *filename, int bank)
 {
 	unsigned int romsrc_len = 0;
 	char *romsrc = load_file(filename, &romsrc_len);
-	if (romsrc)
+	if (romsrc) {
 		add_listing(romsrc, romsrc_len, bank);
+	} else {
+		struct list_segment seg = {
+			.start_addr = 0x6000, .end_addr = 0x7fff,
+			.bank = -1,
+		};
+		remove_conflicting_segments(&seg);
+	}
 }
 
 
