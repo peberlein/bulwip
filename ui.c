@@ -837,6 +837,7 @@ rescan:
 				{	char *entry = copy_line(files, file_off, file_sel);
 					if (!entry) break;
 					set_cart_name(entry);
+					free(entry);
 					//printf("%s\n", entry);
 					reset();
 					ret = 1;
@@ -1300,6 +1301,7 @@ static int reg_menu(int *addr, int *bank)
 	return 0;
 }
 
+
 static unsigned int fill_seg_from_disasm(struct list_segment *seg, int pc)
 {
 	unsigned int offset;
@@ -1312,7 +1314,7 @@ static unsigned int fill_seg_from_disasm(struct list_segment *seg, int pc)
 	undo_pcs(pcs, cycs, ARRAY_SIZE(pcs));
 	seg->src_len = 0;
 	for (i = ARRAY_SIZE(pcs)-1; i >= 0; i--) {
-		disasm(pcs[i]);
+		disasm(pcs[i], cycs[i]);
 		int len = strlen(asm_text);
 
 		txt = realloc(txt, seg->src_len + len + 1);
@@ -1322,7 +1324,7 @@ static unsigned int fill_seg_from_disasm(struct list_segment *seg, int pc)
 #endif
 	offset = seg->src_len;
 	for (i = 0; i < 1024; i++) {
-		pc += disasm(pc);
+		pc += disasm(pc, 0);
 		int len = strlen(asm_text);
 
 		txt = realloc(txt, seg->src_len + len + 1);
@@ -1368,14 +1370,18 @@ debug_redraw:
 			debug_break = DEBUG_STOP;
 			return 0; // return to draw one whole frame, then come back here
 		}
+		// single stepping or paused will redraw whole frame
+		redraw_vdp();
+
 		if (debug_break == DEBUG_SINGLE_STEP) {
+			extern int trace; // cpu.c
 			int c = add_cyc(0); // get current cycle count
+			u16 old_pc = get_pc();
 			if (c > 0)
 				return 0; // VDP update needed
 
 			single_step();
 			debug_break = DEBUG_STOP;
-			redraw_vdp();
 			goto debug_refresh;
 		}
 
@@ -1466,16 +1472,12 @@ debug_redraw:
 			do {
 				if (undo_pop()) break;
 			} while (get_pc() >= a);
-			redraw_vdp();
 			goto debug_refresh;
 		} else if (k == TI_Z) {
 			if (undo_pop() == 0) {
-				redraw_vdp();
 				goto debug_refresh;
 			}
 #endif
-		} else if (k == TI_W) {
-			redraw_vdp();
 		}
 	}
 	mute(0);

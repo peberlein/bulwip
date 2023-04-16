@@ -11,7 +11,10 @@ typedef signed char s8;
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 #endif
 
+#ifndef CPU_TEST
 #define ENABLE_UNDO
+#define LOG_DISASM
+#endif
 
 #ifdef TEST
 // use compiled roms to avoid I/O
@@ -32,8 +35,8 @@ typedef signed char s8;
 extern void cpu_reset(void);
 extern void emu(void);
 extern void single_step(void);
-extern int disasm(u16 pc);
-extern char asm_text[80]; // output from disasm()
+extern int disasm(u16 pc, int cycles);
+extern char asm_text[256]; // output from disasm()
 extern int disasm_cyc; // cpu.c
 extern void interrupt(int level);
 
@@ -111,8 +114,8 @@ enum {
 	DEBUG_SCANLINE_STEP = 4,
 };
 extern int debug_break; // 0=running 1=pause 2=single step 3=frame step
-extern int config_crt_filter; // 0=smooth 1=pixelated 2=crt
 extern int debug_log(const char *fmt, ...);
+extern int config_crt_filter; // 0=smooth 1=pixelated 2=crt
 
 extern int breakpoint_read(u16 address); // called from brk_r()
 extern int breakpoint_write(u16 address); // called from brk_w()
@@ -143,6 +146,34 @@ extern void set_cart_name(char *name);
 extern int get_cart_bank(void);
 extern void paste_text(char *text, int old_fps);
 
+/* more compact undo encoding:
+  <PC_Words:2> 0=<PC:16> 1-3=go back words
+  ST: status bits
+  CYCLES: <count:8>
+  
+  Fast-RAM write: <addr:7> <value:16>
+  Exp-RAM write: <addr:15> <value:16>
+  Keyboard-line: <keyboard_row:3>
+  
+  VDP: decrement address (undo read)
+  VDP: decrement address and set VDP RAM byte (undo write)
+  VDP: address byte and set latch (undo addr write)
+  VDP: address byte and clear latch (undo addr write)
+  VDP: register byte and latch (undo register write)
+  VDP: status byte (undo read status)
+  VDP: decrement Y, wraps at zero
+  
+  GROM: address byte and latch
+  GROM: decrement address (undo read)
+  
+  CB: old cart bank
+  KB: old keyboard row
+  
+  
+  
+*/
+
+
 // Each undo operation is 32-bits, encoded as:
 enum {
 	UNDO_PC = 0x0000, // 0x0000 <PC:16>   
@@ -153,7 +184,7 @@ enum {
 	UNDO_VDPA = 0x0004, // 0x0004 <VdpAddr:16>
 	UNDO_VDPD = 0x0005, // 0x0005 <VdpData:8>
 	UNDO_VDPL = 0x0006, // 0x0006 <VdpLatch:1>
-	UNDO_VDPST = 0x0007, // 0x0007 <VdpStatus:16>
+	UNDO_VDPST = 0x0007, // 0x0007 <VdpStatus:8>
 	UNDO_VDPY = 0x0008, // 0x0008 <VdpY:16>
 	UNDO_VDPR = 0x0009, // 0x0009 <VdpReg:8> <Value:8>
 
@@ -174,6 +205,7 @@ enum {
 #ifdef ENABLE_UNDO
 extern int undo_pop(void);
 extern void undo_push(u16 op, unsigned int value);
+extern void undo_fix_cyc(u16 value);
 extern void undo_pcs(u16 *pcs, u8 *cycs, int count);
 #else
 // static definitions to turn into no-ops

@@ -49,6 +49,7 @@ static GifWriter gif;
 
 
 
+
 #ifdef COMPILED_ROMS
 #include "994arom.h"
 #include "994agrom.h"
@@ -93,9 +94,20 @@ static char* my_strdup(const char *p)
 }
 
 
+// 3000000 cycles per second
+// 59.94 frames per second (59.922743404)
+// pixel clock (5369317.5 Hz)
+// frame time 16.6681545 ms
+// line time 63.695246 us
+// 262 lines per frame (342 pixels/line)
+// 191.085744275 cpu cycles per line
+// 0.558730246 cpu cycles per pixel
+// 1.789772448 pixels / cpu cycle
+#define CYCLES_PER_LINE 191
+
 
 static u16 tms9901_int_mask = 0; // 9901 interrupt mask
-static u8 trace = 1; // disassembly trace flag
+//static u8 trace = 1; // disassembly trace flag
 int debug_en = 0;
 int debug_break = DEBUG_RUN;
 int config_crt_filter = 0;
@@ -243,6 +255,7 @@ void undo_pcs(u16 *pcs, u8 *cycs, int count)
 {
 	int idx = 0;
 	unsigned int i = undo_head;
+	int cyc = add_cyc(0);
 	while (i != undo_tail) {
 		if (i-- == 0) { // wrap around
 			i = ARRAY_SIZE(undo_buffer)-1;
@@ -252,6 +265,11 @@ void undo_pcs(u16 *pcs, u8 *cycs, int count)
 		if ((v >> 16) == UNDO_PC) {
 			pcs[idx++] = w;
 			if (idx == count) break;
+		} else if ((v >> 16) == UNDO_CYC) {
+			cycs[idx] = cyc - (s16)w;
+			cyc = (s16)w;
+		} else if ((v >> 16) == UNDO_VDPY) {
+			cyc += CYCLES_PER_LINE;
 		}
 	}
 }
@@ -269,6 +287,22 @@ void undo_push(u16 op, unsigned int value)
 	}
 }
 
+void undo_fix_cyc(u16 cyc)
+{
+	unsigned int i = undo_head;
+	while (i != undo_tail) {
+		if (i-- == 0) { // wrap around
+			i = ARRAY_SIZE(undo_buffer)-1;
+		}
+		unsigned int v = undo_buffer[i];
+		if ((v >> 16) == UNDO_CYC) {
+			undo_buffer[i] &= 0xffff0000;
+			undo_buffer[i] |= cyc;
+			break;
+		}
+	}
+}
+
 #endif
 
 
@@ -280,15 +314,16 @@ void undo_push(u16 op, unsigned int value)
 static u16 ram_8300_r(u16 address)
 {
 	// fast RAM, incompletely decoded at 8000, 8100, 8200, 8300
-	add_cyc(2);
+	add_cyc(2); // 2 cycles for memory access
 	//debug_log("RAM read %04X = %04X\n", address & 0xfffe, fast_ram[(address & 0xfe) >> 1]);
 	return fast_ram[(address & 0xfe) >> 1];
 }
 
 static void ram_8300_w(u16 address, u16 value)
 {
+	//if (trace) printf("%04x <= %04x\n", address, value);
 	// fast RAM, incompletely decoded at 8000, 8100, 8200, 8300
-	add_cyc(2);
+	add_cyc(2); // 2 cycles for memory access
 	address = (address & 0xfe) >> 1;
 	undo_push(UNDO_CPURAM + address, fast_ram[address]);
 	fast_ram[address] = value;
@@ -302,7 +337,7 @@ static void ram_8300_w(u16 address, u16 value)
 
 static u16 sound_8400_r(u16 address)
 {
-	add_cyc(6);
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	if (address == 0x8400) {
 		// sound chip (illegal to read?)
 		return 0;
@@ -320,7 +355,7 @@ static void sound_8400_w(u16 address, u16 value)
 		snd_w(value >> 8);
 #endif
 	} else {
-		add_cyc(6);
+		add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	}
 }
 
@@ -328,7 +363,7 @@ static void sound_8400_w(u16 address, u16 value)
 
 static u16 vdp_8800_r(u16 address)
 {
-	add_cyc(6);
+	add_cyc(6); // 2 cycles for memory access + 4 for ?
 	vdp.latch = 0;
 	if (address == 0x8800) {
 		// 8800   VDP RAM read data register
@@ -348,7 +383,7 @@ static u16 vdp_8800_r(u16 address)
 
 static u16 vdp_8800_safe_r(u16 address)
 {
-	add_cyc(6);
+	//add_cyc(6);
 	vdp.latch = 0;
 	if (address == 0x8800) {
 		// 8800   VDP RAM read data register
@@ -364,7 +399,7 @@ static u16 vdp_8800_safe_r(u16 address)
 
 static void vdp_8800_w(u16 address, u16 value)
 {
-	add_cyc(6);
+	add_cyc(6); // 2 cycles for memory access + 4 for ?
 	if (address == 0x8800) {
 		// 8800   VDP RAM read data register
 	} else if (address == 0x8802) {
@@ -375,7 +410,7 @@ static void vdp_8800_w(u16 address, u16 value)
 
 static u16 vdp_8c00_r(u16 address)
 {
-	add_cyc(6);
+	add_cyc(6); // 2 cycles for memory access + 4 for ?
 	if (address == 0x8C00) {
 		// 8C00   VDP RAM write data register
 		return 0;
@@ -389,7 +424,7 @@ static u16 vdp_8c00_r(u16 address)
 
 static void vdp_8c00_w(u16 address, u16 value)
 {
-	add_cyc(6);
+	add_cyc(6); // 2 cycles for memory access + 4 for ?
 	if (address == 0x8C00) {
 		// 8C00   VDP RAM write data register
 		//debug_log("VDP write %04X = %02X\n", vdp.a, value >> 8);
@@ -439,7 +474,7 @@ static u16 speech_9000_r(u16 address)
 		// TODO
 		return 0;
 	}
-	add_cyc(6);
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	return 0;
 }
 
@@ -451,7 +486,7 @@ static void speech_9000_w(u16 address, u16 value)
 		// TODO
 		return;
 	}
-	add_cyc(6);
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	return;
 }
 
@@ -487,7 +522,6 @@ static u8 grom_read(void)
 	} else {
 		grom_last = 0;
 	}
-
 	return grom_last;
 }
 
@@ -600,7 +634,7 @@ static void grom_9c00_w(u16 address, u16 value)
 
 static u16 rom_r(u16 address)
 {
-	add_cyc(2);
+	add_cyc(2); // 2 cycles for memory access
 	//printf("%04X => %04X\n", rom[address >> 1]);
 	return rom[address>>1];
 }
@@ -611,7 +645,7 @@ static void rom_w(u16 address, u16 value)
 	debug_log("ROM write %04X %04X at pc=%x\n", address, value, get_pc());
 	//printf("ROM write %04X %04X at pc=%x\n", address, value, get_pc());
 	//trace = 1;
-	add_cyc(2);
+	add_cyc(2);  // 2 cycles for memory access
 }
 
 /****************************************
@@ -620,14 +654,14 @@ static void rom_w(u16 address, u16 value)
 
 static u16 dsr_rom_r(u16 address)
 {
-	add_cyc(6); // 4 extra cycles for multiplexer
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	// TODO each DSR peripheral may do different things based on CRU
 	return 0;
 }
 
 static void dsr_rom_w(u16 address, u16 value)
 {
-	add_cyc(6); // 4 extra cycles for multiplexer
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	// TODO each DSR peripheral may do different things based on CRU
 }
 
@@ -641,7 +675,7 @@ static void set_cart_bank(u16 bank)
 	// 8K banking
 	cart_bank = bank & cart_bank_mask;
 	u16 *base = cart_rom + cart_bank * 4096/*words per 8KB bank*/;
-	printf("%s: address=%04X bank=%d\n", __func__, bank, cart_bank);
+	//printf("%s: address=%04X bank=%d\n", __func__, bank, cart_bank);
 	change_mapping(0x6000, 0x2000, base);
 }
 
@@ -649,7 +683,7 @@ static void cart_rom_w(u16 address, u16 value)
 {
 	undo_push(UNDO_CB, cart_bank);
 	set_cart_bank(address >> 1);
-	add_cyc(6); // 4 extra cycles for multiplexer
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	//debug_log("Cartridge ROM write %04X %04X\n", address, value);
 }
 
@@ -663,17 +697,15 @@ static void cart_rom_w(u16 address, u16 value)
 
 static u16 zero_r(u16 address)
 {
-	add_cyc(6); // 4 extra cycles for multiplexer
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	return 0;
 }
 
 static void zero_w(u16 address, u16 value)
 {
-	add_cyc(6); // 4 extra cycles for multiplexer
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	return;
 }
-
-
 
 
 /****************************************
@@ -686,7 +718,7 @@ static void mem_init(void)
 	ram = malloc(ram_size);
 
 	// system ROM 0000-1fff
-	set_mapping(0x0000, 0x2000, rom_r, zero_w, NULL);
+	set_mapping(0x0000, 0x2000, rom_r, rom_w, NULL);
 
 	// low memory expansion 2000-3fff
 	set_mapping(0x2000, 0x2000, map_r, map_w, ram);
@@ -1238,7 +1270,7 @@ void vdp_line(unsigned int line,
 				if (sprite_count >= config_sprites_per_line)
 					break;
 
-				sprites[sprite_count].p = sp + (s * 8) + (dy - (y+1));
+				sprites[sprite_count].p = sp + (s * 8) + ((dy - (y+1)) >> (reg[1]&1));
 				sprites[sprite_count].x = x;
 				sprites[sprite_count].f = f;
 				sprite_count++;
@@ -1986,24 +2018,11 @@ void update_debug_window(void)
 
 
 
-
-
-
-
-// 3000000 cycles per second
-// 59.94 frames per second (59.922743404)
-// pixel clock (5369317.5 Hz)
-// frame time 16.6681545 ms
-// line time 63.695246 us
-// 262 lines per frame (342 pixels/line)
-// 191.085744275 cpu cycles per line
-// 0.558730246 cpu cycles per pixel
-// 1.789772448 pixels / cpu cycle
-#define CYCLES_PER_LINE 191
-
 int main(int argc, char *argv[])
 {
-	//log = fopen("/tmp/bulwip.log","w");
+#ifdef LOG_DISASM
+	log = fopen("/tmp/bulwip.log","w");
+#endif
 	//log = fopen("/dev/null","w");
 	//log = fopen("/tmp/cpu.log","w");
 	//if (!log) log = stderr;

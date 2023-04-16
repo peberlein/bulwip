@@ -43,7 +43,6 @@ While debugger is open:
 - R: Register select, then Enter to jump to address
 - Z: Reverse instruction step
 - Shift-Z: Reverse instruction step until PC goes lower (good for rewinding out of a loop)
-- W: Redraw VDP screen (normally current scanline rendered)
 - TODO Ctrl->B: Go to referenced label
 
 

@@ -38,38 +38,17 @@
 static u16 gPC, gWP; // st is below with status functions
 static int cyc = 0; // cycle counter (cpu runs until > 0)
 static int interrupt_level = 0; // interrupt level + 1  (call interrupt_check() after modifying)
-static int breakpoint_saved_cyc = 0;
-static struct {
-	u16 pc, op, ts, td, cyc;
-} trace[1024], *tracer = trace;
-
-
-enum {
-	TRACE_PC,
-	TRACE_ST,
-	TRACE_WP,
-	TRACE_MEMR,
-	TRACE_MEMW,
-	TRACE_CRUR,
-	TRACE_CRUW,
-};
-
-u8 trace_what[100];
-u16 trace_addr[100];
-u16 trace_data[100];
-int trace_offset = 0;
-
-static void trace_it(u8 what, u16 addr, u16 data)
-{
-	trace_what[trace_offset] = what;
-	trace_addr[trace_offset] = addr;
-	trace_data[trace_offset++] = data;
-}
+static int breakpoint_saved_cyc = 0; // when a breakpoint is hit, this saves cyc before it gets zeroed
+int trace = 0;
 
 u16 get_pc(void) { return gPC; }
 u16 get_wp(void) { return gWP; }
 u16 get_st(void); // defined below with status functions
-int add_cyc(int add) { cyc += add; return cyc; }
+int add_cyc(int add) {
+	//if (trace && add) printf("+%d\n", add);
+	cyc += add;
+	return cyc;
+}
 
 // needed by undo stack
 void set_pc(u16 pc) { gPC = pc; }
@@ -78,27 +57,23 @@ void set_st(u16); // defined below with status functions
 void set_cyc(s16 c) { cyc = c; }
 
 
-#if 0
-// Setting en will allow the next emu() to return after a single instruction
-// Clearing en will restore the number of saved cycles before returning
-void cpu_break(int en)
-{
-	static int saved_cyc = 0;
-	if (en) {
-		saved_cyc += cyc;
-		cyc = 0;
-	} else {
-		cyc += saved_cyc;
-		saved_cyc = 0;
-	}
-}
-#endif
-
 void single_step(void)
 {
+	int old_pc = gPC;
 	int saved_cyc = cyc;
+
 	cyc = 0;
 	emu(); // this will return after 1 instruction when cyc=0
+	if (trace) {
+		disasm(old_pc, cyc);
+		printf("%s", asm_text);
+	}
+#ifdef ENABLE_UNDO
+	// Since emu was called with cyc=0, the undo stack will also
+	// store UNDO_CYC=0, which will mess up the cycle counts in
+	// the disassembly. Fix it with the original cycle counter.
+	undo_fix_cyc((u16)saved_cyc);
+#endif
 	cyc += saved_cyc;
 	//printf("%s: save=%d cyc=%d\n", __func__, saved_cyc, cyc);
 }
@@ -200,7 +175,6 @@ void set_mapping(int base, int size,
 static always_inline u16 mem_r(u16 address)
 {
 	u16 value = map_read(address >> MAP_SHIFT)(address);
-	//trace_it(TRACE_MEMR, address, value);
 	return value;
 }
 
@@ -214,7 +188,6 @@ u16 safe_r(u16 address)
 
 static always_inline void mem_w(u16 address, u16 value)
 {
-	//trace_it(TRACE_MEMW, address, value);
 	map_write(address >> MAP_SHIFT)(address, value);
 }
 
@@ -252,6 +225,7 @@ u16 map_r(u16 address)
 		debug_log("no memory mapped at %04X (read)\n", address);
 		return 0;
 	}
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	return map_mem(page)[offset >> 1];
 }
 
@@ -263,7 +237,12 @@ void map_w(u16 address, u16 value)
 		debug_log("no memory mapped at %04X (write, %04X)\n", address, value);
 		return;
 	}
-	// undo_push(UNDO_EXPRAM, )  FIXME how to do this?
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
+#ifdef ENABLE_UNDO
+	undo_push(UNDO_EXPRAM,
+	 	((address & (address & 0x8000 ? 0x7ffe : 0x1ffe)) << 15) |
+		map_mem(page)[offset >> 1]);
+#endif
 	map_mem(page)[offset >> 1] = value;
 }
 
@@ -275,10 +254,10 @@ static u16 brk_r(u16 address)
 	if (breakpoint_read(address)) {
 		breakpoint_saved_cyc = cyc;
 		if (address == gPC) {
-			debug_break = 1;
+			debug_break = DEBUG_STOP;
 			return C99_BRK; // instruction decoder will handle this
 		} else {
-			cyc = 0;
+			cyc = 0; // memory read trigger break: return after current instruction
 		}
 	}
 	return map_read_orig(address >> MAP_SHIFT)(address);
@@ -290,8 +269,8 @@ static void brk_w(u16 address, u16 value)
 	map_write_orig(address >> MAP_SHIFT)(address, value);
 	if (breakpoint_write(address)) {
 		breakpoint_saved_cyc = cyc;
-		cyc = 0;
-		debug_break = 1;
+		cyc = 0; // memory write trigger break: return after current instruction
+		debug_break = DEBUG_STOP;
 	}
 }
 
@@ -460,9 +439,8 @@ static always_inline int shift_count(u16 op, u16 wp)
 // source returned as value (indirects are followed)
 static always_inline u16 Ts(u16 op, u16 *pc, u16 wp)
 {
-	u16 val, addr;
+	u16 val, addr = 0;
 	u16 reg = op & 15;
-
 	switch ((op >> 4) & 3) {
 	case 0: // Rx
 		val = reg_r(wp, reg);
@@ -472,12 +450,8 @@ static always_inline u16 Ts(u16 op, u16 *pc, u16 wp)
 		cyc += 2;
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0
-		addr = reg_r(wp, reg);
-		addr = (
-#ifdef ENABLE_TRACE
-			tracer->ts = 
-#endif
-			mem_r(*pc)) + (reg ? addr : 0);
+		if (reg) addr = reg_r(wp, reg); else cyc += 2;
+		addr += mem_r(*pc);
 		*pc += 2;
 		val = mem_r(addr);
 		cyc += 4;
@@ -496,7 +470,7 @@ static always_inline u16 Ts(u16 op, u16 *pc, u16 wp)
 // (indirects are followed)
 static always_inline u16 TsB(u16 op, u16 *pc, u16 wp)
 {
-	u16 val, addr;
+	u16 val, addr = 0;
 	u16 reg = op & 15;
 
 	switch ((op >> 4) & 3) {
@@ -508,12 +482,8 @@ static always_inline u16 TsB(u16 op, u16 *pc, u16 wp)
 		cyc += 2;
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0  10c
-		addr = reg_r(wp, reg);
-		addr = (
-#ifdef ENABLE_TRACE
-			tracer->ts = 
-#endif
-			mem_r(*pc)) + (reg ? addr : 0);
+		if (reg) addr = reg_r(wp, reg); else cyc += 2;
+		addr += mem_r(*pc);
 		*pc += 2;
 		val = mem_r(addr);
 		cyc += 4;
@@ -548,12 +518,9 @@ static always_inline struct val_addr Td(u16 op, u16 *pc, u16 wp)
 		cyc += 2;
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0  10c
-		va.addr = reg_r(wp, reg);
-		va.addr = (
-#ifdef ENABLE_TRACE
-			tracer->td = 
-#endif
-			mem_r(*pc)) + (reg ? va.addr : 0);
+		va.addr = 0;
+		if (reg) va.addr = reg_r(wp, reg); else cyc += 2;
+		va.addr += mem_r(*pc);
 		*pc += 2;
 		va.val = mem_r(va.addr);
 		cyc += 4;
@@ -573,27 +540,26 @@ static always_inline struct val_addr TdB(u16 op, u16 *pc, u16 wp)
 	struct val_addr va;
 	u16 reg = op & 15;
 
-	va.addr = reg_r(wp, reg);
 	switch ((op >> 4) & 3) {
 	case 0: // Rx
-		va.val = va.addr;
+		va.val = reg_r(wp, reg);
 		va.addr = wp + 2 * reg;
 		break;
 	case 1: // *Rx
+		va.addr = reg_r(wp, reg);
 		va.val = mem_r(va.addr);
 		cyc += 2;
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0
-		va.addr = (
-#ifdef ENABLE_TRACE
-			tracer->td = 
-#endif
-			mem_r(*pc)) + (reg ? va.addr : 0);
+		va.addr = 0;
+		if (reg) va.addr = reg_r(wp, reg); else cyc += 2;
+		va.addr += mem_r(*pc);
 		*pc += 2;
 		va.val = mem_r(va.addr);
 		cyc += 4;
 		break;
 	case 3: // *Rx+
+		va.addr = reg_r(wp, reg);
 		va.val = mem_r(va.addr);
 		//reg_w(wp, reg, va.addr + 1); // Post-increment must be done later
 		cyc += 2;
@@ -637,7 +603,6 @@ void cpu_reset(void)
 	set_st(0xc3f0); //0x0060;
 
 	cyc = saved_cyc;
-
 }
 
 void interrupt(int level)
@@ -685,9 +650,6 @@ static const struct {
 #define L4(a,b,c,d) &&a-&&C,&&b-&&C,&&c-&&C,&&d-&&C
 #define L8(a,b,c,d,e,f,g,h) L4(a,b,c,d),L4(e,f,g,h)
 
-int disasm(u16 pc); // forward
-//int disasm_cyc = 0; // actual number of cycles for disassembly
-
 
 // idea for faster indirect memory read/write
 // keep a cache of read/write functions for all 16 registers
@@ -706,21 +668,12 @@ void emu(void)
 #ifdef LOG_DISASM
 	int start_cyc;
 #endif
-#ifdef ENABLE_TRACE
-	int tracer_cyc;
-#endif
 
 	goto start_decoding;
 decode_op:
 #ifdef LOG_DISASM
-	disasm_cyc = cyc - start_cyc;
-	disasm(gPC);
-#endif
-#ifdef ENABLE_TRACE
-	tracer->cyc = cyc - tracer_cyc;
-	tracer++;
-	if (tracer == trace + ARRAY_SIZE(trace))
-		tracer = trace;
+	disasm(gPC, cyc - start_cyc);
+	debug_log("%s", asm_text);
 #endif
 	// when cycle counter rolls positive, go out and render a scanline
 	if (cyc > 0)
@@ -729,22 +682,15 @@ decode_op:
 
 decode_op_now: // this is used by instructions which cannot be interrupted (XOP, BLWP)
 #ifdef LOG_DISASM
-	disasm_cyc = cyc - start_cyc;
-	disasm(gPC);
-#endif
-#ifdef ENABLE_TRACE
-	tracer->cyc = cyc - tracer_cyc;
-	tracer++;
-	if (tracer == trace + ARRAY_SIZE(trace))
-		tracer = trace;
+	disasm(gPC, cyc - start_cyc);
+	debug_log("%s", asm_text);
 #endif
 start_decoding:
 	gPC = pc;  // breakpoints will need to know the current PC
 	if (0/*trace*/) {
-		int save_cyc = cyc;
 		gWP = wp;
-		disasm(pc);
-		cyc = save_cyc;
+		disasm(pc, cyc);
+		//debug_log("%s", asm_text);
 	}
 #ifdef LOG_DISASM
 	start_cyc = cyc;
@@ -754,11 +700,6 @@ start_decoding:
 	undo_push(UNDO_ST, get_st());
 
 	op = mem_r(pc);
-#ifdef ENABLE_TRACE
-	tracer->pc = pc;
-	tracer->op = op;
-	tracer_cyc = cyc;
-#endif
 	// if this mem read triggers a breakpoint, it will save the cycles
 	// before reading the memory and will return C99_BRK
 	pc += 2;
@@ -783,7 +724,7 @@ execute_op:
 					td.val &= ~(ts >> 8);
 					status_parity(status_zero(td.val << 8));
 				} else {
-					td.val &= ~(ts & 0xff00);
+					td.val &= ~ts;
 					status_parity(status_zero(td.val & 0xff00));
 				}
 				mem_w_TdB(op, wp, td);
@@ -802,6 +743,7 @@ execute_op:
 				} else {
 					status_arith(status_parity(ts), td.val & 0xff00);
 				}
+				cyc += 2;
 				Td_post_increment(op, wp, td, 1);
 				goto decode_op;
 			case 5: AB:
@@ -840,7 +782,7 @@ execute_op:
 			case 1: goto UNHANDLED;
 			case 2: SZC: td.val = status_zero(td.val & ~ts); mem_w_Td(op, wp, td); goto decode_op;
 			case 3: S: td.val = sub(td.val, ts); mem_w_Td(op, wp, td); goto decode_op;
-			case 4: C: status_arith(ts, td.val); Td_post_increment(op, wp, td, 2); goto decode_op;
+			case 4: C: status_arith(ts, td.val); cyc+=2; Td_post_increment(op, wp, td, 2); goto decode_op;
 			case 5: A: td.val = add(td.val, ts); mem_w_Td(op, wp, td); goto decode_op;
 			case 6: MOV: td.val = status_zero(ts); mem_w_Td(op, wp, td); goto decode_op;
 			case 7: SOC: td.val = status_zero(td.val | ts); mem_w_Td(op, wp, td); goto decode_op;
@@ -854,12 +796,14 @@ execute_op:
 			u16 ts = Ts(op, &pc, wp);
 			u16 td = reg_r(wp, (op >> 6) & 15);
 			if ((ts & td) == ts) set_EQ(); else clr_EQ();
+			cyc += 2;
 			goto decode_op;
 			}
 		case 1: CZC: {
 			u16 ts = Ts(op, &pc, wp);
 			u16 td = reg_r(wp, (op >> 6) & 15);
 			if (!(ts & td)) set_EQ(); else clr_EQ();
+			cyc += 2;
 			goto decode_op;
 			}
 		case 2: XOR: {
@@ -1018,8 +962,10 @@ execute_op:
 		}
 	case 7-5: { // opcodes 0x0400 .. 0x07ff
 		struct val_addr td;
+		cyc -= 2;
 		switch ((op >> 6) & 15) {
 		case 0: BLWP:
+			cyc += 10;
 			undo_push(UNDO_WP, wp);
 			td = Td(op, &pc, wp);
 			//debug_log("OLD pc=%04X wp=%04X st=%04X  NEW pc=%04X wp=%04X\n", pc, wp, st, safe_r(va.addr+2), va.val);
@@ -1047,13 +993,16 @@ execute_op:
 			status_zero(td.val); // status compared to zero before operation
 			clr_OV();
 			clr_C(); // carry is not listed affected in manual, but it is
+			//printf("%04x\n", td.val);
 			if (td.val & 0x8000) { // negative? (sign bit set)
-				cyc += 2;
+				cyc += 4;
 				if (td.val == 0x8000)
 					set_OV();
 				else {
 					td.val = -td.val;
 				}
+			} else {
+				cyc += 2;
 			}
 			mem_w_Td(op, wp, td);
 			goto decode_op;
@@ -1064,17 +1013,17 @@ execute_op:
 		}
 	case 7-6: { // opcodes 0x0200 .. 0x03ff
 		u8 reg = op & 15;
-		cyc -= 2;
+
 		switch ((op >> 5) & 15) {
-		case 0: LI: reg_w(wp, reg, (reg_r(wp, reg), status_zero(mem_r(pc)))); pc += 2; goto decode_op;
+		case 0: LI: reg_w(wp, reg, status_zero(mem_r(pc))); pc += 2; goto decode_op;
 		case 1: AI: reg_w(wp, reg, add(reg_r(wp, reg), mem_r(pc))); pc += 2; goto decode_op;
 		case 2: ANDI: reg_w(wp, reg, status_zero(reg_r(wp, reg) & mem_r(pc))); pc += 2; goto decode_op;
 		case 3: ORI: reg_w(wp, reg, status_zero(reg_r(wp, reg) | mem_r(pc))); pc += 2; goto decode_op;
-		case 4: CI: status_arith(reg_r(wp, reg), mem_r(pc)); pc += 2; goto decode_op;
+		case 4: CI: status_arith(reg_r(wp, reg), mem_r(pc)); cyc += 2; pc += 2; goto decode_op;
 		case 5: STWP: reg_w(wp, reg, wp); goto decode_op;
 		case 6: STST: reg_w(wp, reg, get_st()); goto decode_op;
-		case 7: LWPI: undo_push(UNDO_WP, wp); wp = mem_r(pc); pc += 2; goto decode_op;
-		case 8: LIMI: set_IM(mem_r(pc) & 15); pc += 2; gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
+		case 7: LWPI: cyc -= 2; undo_push(UNDO_WP, wp); wp = mem_r(pc); cyc += 2; pc += 2; goto decode_op;
+		case 8: LIMI: cyc -= 2; set_IM(mem_r(pc) & 15); pc += 2; gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
 		case 9: goto UNHANDLED;
 		case 10: IDLE: debug_log("IDLE not implemented\n");/* TODO */ goto decode_op;
 		case 11: RSET: debug_log("RSET not implemented\n"); /* TODO */ goto decode_op;
@@ -1089,7 +1038,7 @@ execute_op:
 		printf("%04x: %04x  %d\n", pc, op, (int)__builtin_clz(op));
 		UNHANDLED:
 		if (op == C99_BRK) {
-			if (debug_break == 1) {
+			if (debug_break == DEBUG_STOP) {
 				pc -= 2; // set PC to before this instruction was executed
 				goto done;
 			}
@@ -1119,7 +1068,7 @@ static const char **names[] = {
 
 
 static char reg_text[64] = {};
-char asm_text[80] = {};
+char asm_text[256] = {};
 
 
 static u16 disasm_Ts(u16 pc, u16 op, int opsize)
@@ -1186,7 +1135,7 @@ static u16 disasm_Bs(u16 pc, u16 op, int opsize)
 
 
 // returns number of bytes in the disassembled instruction (2, 4, or 6)
-int disasm(u16 pc)
+int disasm(u16 pc, int cycles)
 {
 	static const int jt1[]={L8(C,CB,A,AB,MOV,MOVB,SOC,SOCB)};
 	static const int jt2[]={L4(SZC,SZCB,S,SB)};
@@ -1209,9 +1158,8 @@ int disasm(u16 pc)
 		pc >= 0x6000 && pc < 0x8000 ? get_cart_bank() : 0, pc, op);
 	if (idx >= ARRAY_SIZE(jt)) {
 		BAD:
-		sprintf(asm_text+strlen(asm_text), "DATA >%04X\n", op);
-		cyc = save_cyc;
-		return 2;
+		sprintf(asm_text+strlen(asm_text), "DATA >%04X", op);
+		goto done;
 	}
 	u8 subidx = (op >> decode[idx].shift) & decode[idx].mask;
 
@@ -1283,6 +1231,14 @@ LWPI: LIMI:
 	goto done;
 
 done:
+	if (cycles) {
+		int n = 50;
+		char tmp[10];
+		int i = strlen(asm_text);
+		sprintf(tmp, "(%d)", cycles);
+		memset(asm_text + i, ' ', n - i);
+		strcpy(asm_text + n - strlen(tmp), tmp);
+	}
 	sprintf(asm_text+strlen(asm_text), "\n");
 	//sprintf(asm_text+strlen(asm_text), "\t\t%s\n", reg_text);
 	//sprintf(asm_text+strlen(asm_text), "\t\t(%d)\n", disasm_cyc);
@@ -1297,4 +1253,233 @@ done:
 
 
 
+#ifdef CPU_TEST
 
+// assemble src, returns number of words written to dst
+static int as(const char *src, u16 *dst)
+{
+	struct {
+		char *str;
+		u16 base;
+		int fmt;
+	} fmts[] = {
+		{"LI", 0x200, 8}, {"AI", 0x220, 8}, {"ANDI", 0x240, 8}, {"ORI", 0x260, 8}, {"CI", 0x280, 8},
+		{"STWP", 0x2A0, 10}, {"STST", 0x2C0, 10}, {"LWPI", 0x2E0, 10}, {"LIMI", 0x300, 10},
+		{"IDLE", 0x340, 7}, {"RSET", 0x360, 7}, {"RTWP", 0x380, 7}, {"CKON", 0x3A0, 7}, {"CKOF", 0x3C0, 7}, {"LREX", 0x3E0, 7},
+		{"BLWP", 0x400, 6}, {"B", 0x440, 6}, {"X", 0x480, 6}, {"CLR", 0x4C0, 6}, {"NEG", 0x500, 6},
+		{"INV", 0x540, 6}, {"INC", 0x580, 6}, {"INCT", 0x5C0, 6}, {"DEC", 0x600, 6}, {"DECT", 0x640, 6},
+		{"BL", 0x680, 6}, {"SWPB", 0x6C0, 6}, {"SETO", 0x700, 6}, {"ABS", 0x740, 6},
+		{"SRA", 0x800, 5}, {"SRL", 0x900, 5}, {"SLA", 0xA00, 5}, {"SRC", 0xB00, 5},
+		{"JMP", 0x1000, 2}, {"JLT", 0x1100, 2}, {"JLE", 0x1200, 2}, {"JEQ", 0x1300, 2},
+		{"JHE", 0x1400, 2}, {"JGT", 0x1500, 2}, {"JNE", 0x1600, 2}, {"JNC", 0x1700, 2},
+		{"JOC", 0x1800, 2}, {"JNO", 0x1900, 2}, {"JL", 0x1A00, 2}, {"JH", 0x1B00, 2},
+		{"JOP", 0x1C00, 2}, {"SBO", 0x1D00, 2}, {"SBZ", 0x1E00, 2}, {"TB", 0x1F00, 2},
+		{"COC", 0x2000, 3}, {"CZC", 0x2400, 3}, {"XOR", 0x2800, 3}, {"XOP", 0x2C00, 9},
+		{"LDCR", 0x00, 4}, {"STCR", 0x3400, 4}, {"MPY", 0x3800, 9}, {"DIV", 0x3C00, 9},
+		{"SZC", 0x4000, 1}, {"SZCB", 0x5000, 1}, {"S", 0x6000, 1}, {"SB", 0x7000, 1},
+		{"C", 0x8000, 1}, {"CB", 0x9000, 1}, {"A", 0xA000, 1}, {"AB", 0xB000, 1},
+		{"MOV", 0xC000, 1}, {"MOVB", 0xD000, 1}, {"SOC", 0xE000, 1}, {"SOCB", 0xF000, 1},
+	};
+	int i;
+	for (i = 0; i < ARRAY_SIZE(fmts); i++) {
+		int len = strlen(fmts[i].str);
+		int n = 0;
+		if (strncmp(src, fmts[i].str, len)  != 0) continue;
+		if (src[len] != 0 && src[len] != ' ') continue;
+		src += len; // skip word
+		while (src[0] == ' ') src++; // skip spaces
+		dst[n++] = fmts[i].base;
+		switch (fmts[i].fmt) {
+			// TODO
+		}
+		return n;
+	}
+	return 0;
+}
+
+
+// Stubs for testing
+#include <stdarg.h>
+int breakpoint_read(u16 address) { return 0; }
+int breakpoint_write(u16 address) { return 0; }
+int debug_log(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int ret = vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	return ret;
+}
+int debug_break = DEBUG_RUN;
+u8 cru_r(u16 bit) { return 1; }
+void cru_w(u16 bit, u8 value) {}
+void unhandled(u16 pc, u16 op) {}
+int get_cart_bank(void) { return 0; }
+
+
+
+static u16 fast_ram[128] = {}; // 256 bytes at 8000-80ff,repeated at 8100,8200,8300
+static u16 *ram = NULL; // 32k RAM or SAMS
+static unsigned int ram_size = 0; // in bytes
+
+/******************************************
+ * 8000-83FF  fast RAM                    *
+ ******************************************/
+
+static u16 ram_8300_r(u16 address)
+{
+	// fast RAM, incompletely decoded at 8000, 8100, 8200, 8300
+	add_cyc(2);
+	return fast_ram[(address & 0xfe) >> 1];
+}
+
+static void ram_8300_w(u16 address, u16 value)
+{
+	add_cyc(2);
+	fast_ram[(address & 0xfe) >> 1] = value;
+}
+
+void generate_test_code(u16 *dest)
+{
+	FILE *f = fopen("test/timing.asm", "wb");
+	int wp, i, j, k, l;
+
+	if (!f) return;
+	fprintf(f, //"       aorg >A000\n"
+	           //"       data >0000,>A000,end->A000\n"
+		   "       aorg >6000\n"
+		   "       data >aa00,>0100,>0000\n"
+		   "       data prglst,>0000\n"
+		   "prglst data >0000,start\n"
+		   "       stri 'TEST'\n"
+		   "       even\n"
+		   "start\n"
+		   );
+
+
+	for (wp = 0; wp < 2; wp++) {
+		const char *srcs[] = {"r0","*r8","*r9","*r8+","*r9+","@2(r8)","@2(r9)","@>201e","@>831e"};
+		const char *dsts[] = {"r1","*r8","*r9","*r8+","*r9+","@2(r8)","@2(r9)","@>201e","@>831e"};
+		const char *sspd[] = {"","s+","s-","s+","s-","s+","s-","",""};
+		const char *dspd[] = {"","d+","d-","d+","d-","d+","d-","",""};
+
+		fprintf(f, "       lwpi >%04x\n"
+			   "       li r8,>2020\n",
+				wp == 0 ? 0x8300 : 0x2000);
+
+		for (i = 0; i < 10; i++) {
+			const char *isns[] = {"szc","szcb","s","sb","c","cb","a","ab","soc","socb"};
+			const char *isn = isns[i];
+
+			fputs("       li r9,>8320\n", f);
+			for (j = 0; j < ARRAY_SIZE(srcs); j++) {
+				for (k = 0; k < ARRAY_SIZE(dsts); k++) {
+					fprintf(f, "       %s %s,%s%s%s%s\n", isn,
+						srcs[j], dsts[k],
+						sspd[j][0]||dspd[k][0] ? " ;: " : "",
+						sspd[j], dspd[k]);
+				}
+			}
+		}
+		for (i = 0; i < 3; i++) {
+			const char *isns[] = {"coc","czc","xor"};
+			const char *isn = isns[i];
+			for (j = 0; j < ARRAY_SIZE(srcs); j++) {
+				fprintf(f, "       %s %s,%s%s%s%s\n", isn,
+					srcs[j], "r1",
+					sspd[j][0] ? " ;: " : "",
+					sspd[j], "");
+			}
+		}
+		for (i = 0; i < 4; i++) {
+			const char *isns[] = {"sra","srl","sla","src"};
+			const char *isn = isns[i];
+			for (j = 1; j < 16; j++) {
+				fprintf(f, "       %s r0,%d\n", isn, j);
+			}
+		}
+		for (i = 0; i < 10; i++) {
+			const char *isns[] = {"clr","neg","inv","inc","inct","dec","dect","swpb","seto","abs"};
+			const char *isn = isns[i];
+			for (j = 0; j < ARRAY_SIZE(srcs); j++) {
+				fprintf(f, "       %s %s %s%s\n", isn,
+					srcs[j], 
+					sspd[j][0] ? " ;: " : "",
+					sspd[j]);
+			}
+		}
+		for (i = 0; i < 5; i++) {
+			const char *isns[] = {"li","ai","andi","ori","ci"};
+			const char *isn = isns[i];
+			fprintf(f, "       %s r0,>1234\n", isn);
+		}
+	}
+	fputs("       b @$+4\n"
+	      "       li r0,$+6\n"
+	      "       b *r0\n"
+	      "       jmp $\n"
+		"end\n", f);
+	fclose(f);
+	if (system("make -B -C test timingc.bin")) return;
+
+	f = fopen("test/timingc.bin","rb");
+	if (!f) abort();
+	u16 *pcptr = dest + 6;
+	while (!feof(f)) {
+		unsigned char b[2];
+		if (fread(b, 1, 2, f) != 2) break;
+		*dest++ = (b[0] << 8) | b[1];
+	}
+	fclose(f);
+	gPC = *pcptr;
+
+	f = fopen("test/timingc.lst","rb");
+	if (!f) abort();
+	while (!feof(f)) {
+		char line[256];
+		int pc, cc;
+		if (!fgets(line, 256, f)) break;
+		if (strlen(line) < 17) continue;
+		pc = strtol(line+5, NULL, 16); // program counter for this line
+		if (pc != gPC) continue;
+		cc = strtol(line+16, NULL, 10); // cycle count for this line
+
+		cyc = 0; single_step(); // run 1 instruction and get cycle count
+		if (cyc != cc) {
+			disasm(pc, cyc);
+			printf("%s", asm_text);
+			printf("expected %d     WP=%04x R8=%04x R9=%04X\n", cc,
+				gWP, reg_r(gWP, 8),reg_r(gWP, 9),
+				line);
+			//break;
+		}
+	}
+	fclose(f);
+}
+
+
+
+int main(int argc, char *argv[])
+{
+	ram_size = 32 * 1024; // 32K 
+	ram = calloc(ram_size, 1);
+	u16 *cart = calloc(8, 1024); // 8K
+
+	// test ram 2000-3fff
+	set_mapping(0x2000, 0x2000, map_r, map_w, ram);
+	set_mapping(0xa000, 0x6000, map_r, map_w, ram+0x1000/*words*/);
+	set_mapping(0x6000, 0x2000, map_r, map_w, cart);
+
+	// memory mapped devices 8000-9fff
+	set_mapping(0x8000, 0x400, ram_8300_r, ram_8300_w, NULL);
+
+
+	gPC = 0xa000;
+
+	generate_test_code(cart); // load and run program at >6000
+
+
+	return 0;
+}
+
+#endif
