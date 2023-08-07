@@ -53,7 +53,7 @@ int add_cyc(int add) {
 // needed by undo stack
 void set_pc(u16 pc) { gPC = pc; }
 void set_wp(u16 wp) { gWP = wp; }
-void set_st(u16); // defined below with status functions
+void set_st(u16 st); // defined below with status functions
 void set_cyc(s16 c) { cyc = c; }
 
 
@@ -240,7 +240,7 @@ void map_w(u16 address, u16 value)
 	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 #ifdef ENABLE_UNDO
 	undo_push(UNDO_EXPRAM,
-	 	((address & (address & 0x8000 ? 0x7ffe : 0x1ffe)) << 15) |
+		((address & (address & 0x8000 ? 0x7ffe : 0x1ffe)) << 15) |
 		map_mem(page)[offset >> 1]);
 #endif
 	map_mem(page)[offset >> 1] = value;
@@ -685,6 +685,8 @@ decode_op_now: // this is used by instructions which cannot be interrupted (XOP,
 	disasm(gPC, cyc - start_cyc);
 	debug_log("%s", asm_text);
 #endif
+	gPC = pc;  // breakpoints will need to know the current PC
+	goto start_decoding_skip_undo;
 start_decoding:
 	gPC = pc;  // breakpoints will need to know the current PC
 	if (0/*trace*/) {
@@ -698,6 +700,7 @@ start_decoding:
 	undo_push(UNDO_PC, pc);
 	undo_push(UNDO_CYC, (u16)cyc);
 	undo_push(UNDO_ST, get_st());
+start_decoding_skip_undo:
 
 	op = mem_r(pc);
 	// if this mem read triggers a breakpoint, it will save the cycles
@@ -818,6 +821,7 @@ execute_op:
 			u8 reg = (op >> 6) & 15; // XOP number usually 1 or 2
 			u16 ts = mem_r(0x0040 + (reg << 2)); // new WP
 
+			undo_push(UNDO_WP, wp);
 			mem_w(ts + 2*11, td.addr); // gAS copied to R11
 			Td_post_increment(op, wp, td, 2);
 			mem_w(ts + 2*13, wp); // WP to R13
@@ -1023,7 +1027,7 @@ execute_op:
 		case 5: STWP: reg_w(wp, reg, wp); goto decode_op;
 		case 6: STST: reg_w(wp, reg, get_st()); goto decode_op;
 		case 7: LWPI: cyc -= 2; undo_push(UNDO_WP, wp); wp = mem_r(pc); cyc += 2; pc += 2; goto decode_op;
-		case 8: LIMI: cyc -= 2; set_IM(mem_r(pc) & 15); pc += 2; gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
+		case 8: LIMI: cyc -= 2; undo_push(UNDO_WP, wp); set_IM(mem_r(pc) & 15); pc += 2; gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
 		case 9: goto UNHANDLED;
 		case 10: IDLE: debug_log("IDLE not implemented\n");/* TODO */ goto decode_op;
 		case 11: RSET: debug_log("RSET not implemented\n"); /* TODO */ goto decode_op;
@@ -1154,8 +1158,11 @@ int disasm(u16 pc, int cycles)
 	asm_text[0] = 0; // clear the disassembly string
 	reg_text[0] = 0; // clear register value string
 	// note: for breakpoints to work, PC must be at column 5 or 6
-	sprintf(asm_text+strlen(asm_text), " %-3d %04X  %04X  ",
-		pc >= 0x6000 && pc < 0x8000 ? get_cart_bank() : 0, pc, op);
+	if (pc >= 0x6000 && pc < 0x8000)
+		sprintf(asm_text+strlen(asm_text), " %-3d %04X  %04X  ",
+		 	get_cart_bank(), pc, op);
+	else
+		sprintf(asm_text+strlen(asm_text), "     %04X  %04X  ", pc, op);
 	if (idx >= ARRAY_SIZE(jt)) {
 		BAD:
 		sprintf(asm_text+strlen(asm_text), "DATA >%04X", op);
@@ -1448,7 +1455,7 @@ void generate_test_code(u16 *dest)
 		if (cyc != cc) {
 			disasm(pc, cyc);
 			printf("%s", asm_text);
-			printf("expected %d     WP=%04x R8=%04x R9=%04X\n", cc,
+			printf("expected %d     WP=%04x R8=%04x R9=%04X\n%s\n", cc,
 				gWP, reg_r(gWP, 8),reg_r(gWP, 9),
 				line);
 			//break;
