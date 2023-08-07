@@ -54,3 +54,6 @@ eptest.bin_0000: eptest.asm
 test:
 	dd if=cpudump.bin bs=1k skip=40 count=7|hexdump -C > cpudump.txt
 	dd if=MEMDUMP.BIN bs=1 skip=40960 count=7294|tee 99test3.dat | hexdump -C > memdump.txt
+
+cputest: cpu.c cpu.h
+	gcc -g cpu.c -DCPU_TEST -o $@
