@@ -2197,17 +2197,6 @@ void update_debug_window(void)
 			// linear, otherwise 02/13 layout for 16x16 sprites
 			scr[i] = !sp_size ? i : ((i & 0xc0)|((i&31)<<1)|((i>>5)&1));
 		}
-		if (sp_size) {
-			static int once = 1;
-			if (once) {
-				once = 0;
-				for (i = 0; i < 32*8; i++) {
-					printf("%02x ", scr[i]);
-					if ((i & 31) == 31) printf("\n");
-				}
-			}
-
-		}
 
 		for (i = 0; i < 8*8; i++) {
 			vdp_lock_debug_texture(i+16*8, 640, &pixels);

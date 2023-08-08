@@ -13,7 +13,7 @@ typedef signed char s8;
 
 #ifndef CPU_TEST
 #define ENABLE_UNDO
-#define LOG_DISASM
+//#define LOG_DISASM
 #endif
 
 #ifdef TEST
