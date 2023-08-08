@@ -86,8 +86,10 @@ extern void vdp_init(void);
 extern void vdp_done(void);
 extern int vdp_update(void);
 //extern void vdp_line(unsigned int y, u8* restrict reg, u8* restrict ram);
-extern void vdp_lock_texture(int line, int len, void**pixels, int *pitch);
+extern void vdp_lock_texture(int line, int len, void**pixels);
 extern void vdp_unlock_texture(void);
+extern void vdp_lock_debug_texture(int line, int len, void**pixels);
+extern void vdp_unlock_debug_texture(void);
 extern void vdp_text_window(const char *line, int w, int h, int x, int y, int highlight_line);
 extern void vdp_text_pat(unsigned char *pat);
 extern void mute(int en);
@@ -100,6 +102,11 @@ extern void load_listing(const char *filename, int bank);
 extern int main_menu(void);
 extern int debug_window(void);
 extern void set_ui_key(int);
+
+extern struct config_struct {
+	int crt_filter;  // 0=smooth 1=pixelated 2=crt
+	int frame_rate;  // 59940=NTSC 50000=PAL etc
+} cfg;
 
 
 
@@ -115,7 +122,7 @@ enum {
 };
 extern int debug_break; // 0=running 1=pause 2=single step 3=frame step
 extern int debug_log(const char *fmt, ...);
-extern int config_crt_filter; // 0=smooth 1=pixelated 2=crt
+//extern int config_crt_filter;  // 0=smooth 1=pixelated 2=crt
 
 extern int breakpoint_read(u16 address); // called from brk_r()
 extern int breakpoint_write(u16 address); // called from brk_w()
@@ -145,18 +152,32 @@ extern int vdp_update_or_menu(void);
 extern void set_cart_name(char *name);
 extern int get_cart_bank(void);
 extern void paste_text(char *text, int old_fps);
+extern unsigned int get_total_cpu_cycles(void);
 
 /* more compact undo encoding:
-  <PC_Words:2> 0=<PC:16> 1-3=go back words
-  ST: status bits
+  Program counter: <PC_Words:2> 0=<PC:16> 1-3=go back N words
+  Status flags: <st:6>  (not include X-op)
+
+  Fast-RAM writes flag: <fast:1>
+  Exp-RAM writes flag: <exp:1>
+  Specials flags: <special:1>
+  Decrement VDP.Y: <vdp.y:1>
+
   CYCLES: <count:8>
+    
   
-  Fast-RAM write: <addr:7> <value:16>
-  Exp-RAM write: <addr:15> <value:16>
+  Fast-RAM write: <last:1> <addr:7> <value:16>
+  Exp-RAM write: <last:1> <addr:15> <value:16>
+
+  Specials:
   Keyboard-line: <keyboard_row:3>
+  Cart-bank: <cart_bank:16>
+  Grom-address-decrement
+  Set/clear X-op flag
   
-  VDP: decrement address (undo read)
-  VDP: decrement address and set VDP RAM byte (undo write)
+  
+  VDP: decrement address (undo read data)
+  VDP: decrement address and set VDP RAM byte (undo write data)
   VDP: address byte and set latch (undo addr write)
   VDP: address byte and clear latch (undo addr write)
   VDP: register byte and latch (undo register write)
@@ -166,10 +187,6 @@ extern void paste_text(char *text, int old_fps);
   GROM: address byte and latch
   GROM: decrement address (undo read)
   
-  CB: old cart bank
-  KB: old keyboard row
-  
-  
   
 */
 
@@ -178,7 +195,7 @@ extern void paste_text(char *text, int old_fps);
 enum {
 	UNDO_PC = 0x0000, // 0x0000 <PC:16>   
 	UNDO_WP = 0x0001, // 0x0001 <WP:16>
-	UNDO_ST = 0x0002, // 0x0002 <ST:16>
+	UNDO_ST = 0x0002, // 0x0002 <ST:16>  only 7+4 bits actually used
 	UNDO_CYC= 0x0003, // 0x0003 <Cyc:16>
 
 	UNDO_VDPA = 0x0004, // 0x0004 <VdpAddr:16>
@@ -196,10 +213,12 @@ enum {
 	UNDO_KB = 0x000e, // 0x000e <KeyboardLine:3>
 
 	UNDO_CPURAM = 0x0080, // 0x00 0b1 <FastRamAddr:7> <Value:16>
-	UNDO_VDPRAM = 0x1000, // 0b0001   <VDPRamAddr:12> <Value:8>
-		// 0b001
+		// 0x0100 to 0x0fff available
+	UNDO_VDPRAM = 0x1000, // 0b0001   <VDPRamAddr:14> <Value:8>
+		// 0x2000 to 0x3fff available
 	UNDO_EXPRAM = 0x4000, // 0b01 <ExpRamAddr:14> <Value:16>
-		// 0b1 
+		// 0x8000 to 0xffff available
+	
 };
 
 #ifdef ENABLE_UNDO
@@ -260,12 +279,13 @@ enum {  // bits[5..3]=row  bits[2..0]=col
 // Arrows and Tab apply to joystick if CRU is scanning joysticks (inactive 3sec)
 
 // Classic99 debug opcodes
-#define C99_NORM 0x0110    // CPU Normal
-#define C99_OVRD 0x0111    // CPU Overdrive
-#define C99_SMAX 0x0112    // System Maximum
-#define C99_BRK  0x0113    // Breakpoint
-#define C99_QUIT 0x0114    // Quit emulator
-#define C99_DBG  0x0120    // debug printf +register number
-
+enum {
+	C99_NORM = 0x0110,    // CPU Normal
+	C99_OVRD = 0x0111,    // CPU Overdrive
+	C99_SMAX = 0x0112,    // System Maximum
+	C99_BRK  = 0x0113,    // Breakpoint
+	C99_QUIT = 0x0114,    // Quit emulator
+	C99_DBG  = 0x0120,    // debug printf +register number
+};
 
 #endif

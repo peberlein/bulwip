@@ -46,6 +46,11 @@
 #include "cpu.h"
 
 
+struct config_struct cfg = {
+	.crt_filter = 0, // smoothed
+	.frame_rate = NTSC_FPS,
+};
+
 #define CLEAR  0x00000000
 #define SHADOW 0x80000000
 #define BLACK  0xff000000
@@ -88,7 +93,7 @@ static void *safe_alloc(size_t size)
 	return p;
 }
 
-
+// loads a file into a nul-terminated memory buffer and returns its address and size
 static char* load_file(const char *filename, unsigned int *out_size)
 {
 	FILE *f = fopen(filename, "rb");
@@ -106,7 +111,9 @@ static char* load_file(const char *filename, unsigned int *out_size)
 	return p;
 }
 
-
+// Returns the offset of the start of the next line in the 
+// multiline string "lst" of length "len" starting from offset "a"
+// Otherwise if there are no more lines, returns "a"
 unsigned int next_line(const char *lst, unsigned int len, unsigned int a)
 {
 	// skip non-newline chars until end of line
@@ -119,6 +126,9 @@ unsigned int next_line(const char *lst, unsigned int len, unsigned int a)
 	return a < len ? a+1 : a;
 }
 
+// Returns the offset of the start of the previous line in the 
+// multiline string "lst" of length "len" starting from offset "a"
+// Otherwise if there are no more lines, returns "a"
 unsigned int prev_line(const char *lst, unsigned int len, unsigned int a)
 {
 	// skip newline chars until end of prev line
@@ -134,6 +144,8 @@ unsigned int prev_line(const char *lst, unsigned int len, unsigned int a)
 	return a;
 }
 
+// Returns the offset of the start of the "delta"-th line in the 
+// multiline string "lst" of length "len" starting from offset "a"
 unsigned int step_lines(const char *lst, unsigned int len, unsigned int a, int delta)
 {
 	while (delta < 0) {
@@ -159,6 +171,8 @@ static int count_lines(const char *lst, unsigned int len, unsigned int a)
 	return ret;
 }
 
+// Returns the length of the line in the multiline string (must be nul-terminated) 
+// from the offset "offset" (must be at the start of the line)
 static int line_len(const char *lst, unsigned int offset)
 {
 	int len = 0;
@@ -269,7 +283,7 @@ static void end_segment(struct list_segment *seg, int pc, int off)
 	seg->end_addr = pc != -1 ? pc : seg->start_addr;
 	seg->end_off = off;
 	remove_conflicting_segments(seg);
-	printf("list %d-%d pc=%04x-%04x bank %d\n",
+	if (0) printf("list %d-%d pc=%04x-%04x bank %d\n",
 		seg->start_off, seg->end_off,
 		seg->start_addr, seg->end_addr,
 		seg->bank);
@@ -524,7 +538,13 @@ static int fps_menu(void)
 		"= 1000 FPS         =\n"
 		"= SYSTEM MAXIMUM   =\n"
 		"====================\n";
-	static int sel = 1;
+	int sel =
+		cfg.frame_rate == NTSC_FPS ? 1 :
+		cfg.frame_rate == PAL_FPS ? 2 :
+		cfg.frame_rate == 100*1000 ? 3 :
+		cfg.frame_rate == 200*1000 ? 4 :
+		cfg.frame_rate == 1000*1000 ? 5 :
+		cfg.frame_rate == 0 ? 6 : 1;
 	int w = 20, h = 8;
 
 	while (1) {
@@ -537,12 +557,12 @@ static int fps_menu(void)
 		case TI_DOWN1: if (sel < 6) sel++; break;
 		case TI_ENTER: case TI_FIRE1: case TI_SPACE:
 			switch (sel) {
-			case 1: vdp_set_fps(NTSC_FPS); break;
-			case 2: vdp_set_fps(PAL_FPS); break;
-			case 3: vdp_set_fps(100 * 1000); break;
-			case 4: vdp_set_fps(200 * 1000); break;
-			case 5: vdp_set_fps(1000 * 1000); break;
-			case 6: vdp_set_fps(0); break;
+			case 1: vdp_set_fps((cfg.frame_rate = NTSC_FPS)); break;
+			case 2: vdp_set_fps((cfg.frame_rate = PAL_FPS)); break;
+			case 3: vdp_set_fps((cfg.frame_rate = 100 * 1000)); break;
+			case 4: vdp_set_fps((cfg.frame_rate = 200 * 1000)); break;
+			case 5: vdp_set_fps((cfg.frame_rate = 1000 * 1000)); break;
+			case 6: vdp_set_fps((cfg.frame_rate = 0)); break;
 			}
 			vdp_text_clear(MENU_X,MENU_Y, w+2,h+1, CLEAR);
 			return 0;
@@ -593,7 +613,7 @@ static int crt_filter_menu(void)
 		"= THX2 GITHUB.COM/  =\n"
 		"= LMP88959/NTSC-CRT =\n"
 		"=====================\n";
-	int sel = config_crt_filter+1;
+	int sel = cfg.crt_filter+1;
 	int w = 21, h = 8;
 
 	while (1) {
@@ -606,7 +626,7 @@ static int crt_filter_menu(void)
 		case TI_DOWN1: if (sel < 3) sel++; break;
 		case TI_ENTER: case TI_FIRE1: case TI_SPACE:
 			vdp_text_clear(MENU_X,MENU_Y, w+2,h+1, CLEAR);
-			config_crt_filter = sel-1;
+			cfg.crt_filter = sel-1;
 			vdp_set_filter(); // reinits the screen texture
 			return 0;
 		case -1: return -1;
@@ -1361,7 +1381,7 @@ debug_redraw:
 		draw_listing(seg, &offset, &line, -line);
 	}
 
-	if (debug_break) {
+	if (debug_break != DEBUG_RUN) {
 		mute(1); // turn off sounds while stopped
 	}
 	while (debug_break != DEBUG_RUN) {
@@ -1387,13 +1407,19 @@ debug_redraw:
 
 		int k = wait_key();
 		//print_key(k);
-		if (k == TI_MENU) {
-			k = main_menu();
-		} else if (k == TI_R) {
-			k = reg_menu(&addr, &bank);
-			if (k != -1) goto debug_refresh_window;
+		switch (k) {
+		case -1: return -1; // quit
+		case TI_MENU: if (main_menu() == -1) return -1; break;
+			{ extern int debug_pattern_type; // bulwip.c
+		case TI_1: debug_pattern_type = 0; goto debug_refresh_window;
+		case TI_2: debug_pattern_type = 1; goto debug_refresh_window;
+		case TI_3: debug_pattern_type = 2; goto debug_refresh_window;
+		case TI_S: debug_pattern_type = 3; goto debug_refresh_window;
+			}
+		case TI_R:
+			if (reg_menu(&addr, &bank) == -1) return -1;
+			goto debug_refresh_window;
 		}
-		if (k == -1) return -1; // quit
 
 		if (seg) {
 			switch (k) {
@@ -1435,6 +1461,7 @@ debug_redraw:
 				if (do_find(seg->src, &offset, &line))
 					goto debug_redraw;
 				break;
+
 			case TI_B:
 			case TI_DELETE: {
 				unsigned int off = step_lines(seg->src, seg->src_len, offset, line);

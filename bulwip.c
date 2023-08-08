@@ -32,7 +32,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <ctype.h>
-
+#include <stdbool.h>
 
 
 #ifndef PATH_MAX
@@ -116,7 +116,7 @@ static void dbg_break(int en) { debug_en = 1; debug_break = en; }
 
 static u16 fast_ram[128] = {}; // 256 bytes at 8000-80ff,repeated at 8100,8200,8300
 
-static u16 *ram = NULL; // 32k RAM or SAMS
+static u16 *ram = NULL; // 32k RAM or SAMS (TODO)
 static unsigned int ram_size = 0; // in bytes
 
 char *cartridge_name = NULL;
@@ -125,7 +125,7 @@ static unsigned int cart_rom_size = 0;
 static u8 *cart_grom = NULL;
 static unsigned int cart_grom_size = 0;
 static u16 cart_bank_mask = 0;
-static u16 cart_bank = 0;
+static u16 cart_bank = 0; // up to 512MB cart size
 
 static u16 *rom = NULL;
 static unsigned int rom_size = 0;
@@ -141,8 +141,10 @@ static u8 keyboard_row = 0;
 static u8 timer_mode = 0;
 static u8 alpha_lock = 0;
 static unsigned int total_cycles = 0;
+static volatile unsigned int total_cycles_busy = 0;
 
 #define VDP_RAM_SIZE (16*1024)
+#define VDP_ST 8
 static struct vdp {
 	u8 ram[VDP_RAM_SIZE];
 	u16 a; // address
@@ -171,9 +173,10 @@ struct state {
 	int cyc;
 };
 
-struct state* save_state(void)
+struct state* save_state(struct state *s)
 {
-	struct state *s = malloc(sizeof(struct state));
+	if (!s) s = malloc(sizeof(struct state));
+	memset(s, 0, sizeof(struct state));
 	s->pc = get_pc();
 	s->wp = get_wp();
 	s->st = get_st();
@@ -189,6 +192,91 @@ struct state* save_state(void)
 	memcpy(&s->vdp, &vdp, sizeof(struct vdp));
 	s->cyc = add_cyc(0);
 	return s;
+}
+
+void load_state(struct state *s)
+{
+	// cpu.c (undo access only!)
+	extern void set_pc(u16);
+	extern void set_wp(u16);
+	extern void set_st(u16);
+	extern void set_cyc(s16);
+
+	set_pc(s->pc);
+	set_wp(s->wp);
+	set_st(s->st);
+
+	memcpy(fast_ram, s->fast_ram, sizeof(fast_ram));
+	memcpy(ram, s->ram, sizeof(s->ram));
+	cart_bank = s->cart_bank;
+	grom_latch = s->grom_latch;
+	grom_last = s->grom_last;
+	ga = s->ga;
+	keyboard_row = s->keyboard_row;
+	timer_mode = s->timer_mode;
+	alpha_lock = s->alpha_lock;
+	memcpy(&vdp, &s->vdp, sizeof(struct vdp));
+	set_cyc(s->cyc);
+}
+
+void print_state(FILE *f, struct state *s)
+{
+	int i;
+	fprintf(f, "PC = %04X\nWP = %04X\nST = %04X\ncyc = %d\n", s->pc, s->wp, s->st, s->cyc);
+	for (i = 0; i < 256/16; i++) {
+		u16 *p = s->fast_ram+i*8;
+		fprintf(f, "%04X: %04x %04x %04x %04x  %04x %04x %04x %04x\n",
+			0x8300+i*16,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+	}
+	fprintf(f,
+		"cart_bank = %04X\n"
+		"grom_latch = %d\n"
+		"grom_last = %02X\n"
+		"grom_addr = %04X\n"
+		"keyboard_row = %d\n"
+		"timer_mode = %d\n"
+		"alpha_lock = %d\n"
+		"VDP_ADDR = %04X\n"
+		"VDP_latch = %d\n"
+		"VDP_Y = %d\n"
+		"VDP_REG[0] = %02X\n"
+		"VDP_REG[1] = %02X\n"
+		"VDP_REG[2] = %02X\n"
+		"VDP_REG[3] = %02X\n"
+		"VDP_REG[4] = %02X\n"
+		"VDP_REG[5] = %02X\n"
+		"VDP_REG[6] = %02X\n"
+		"VDP_REG[7] = %02X\n"
+		"VDP_ST = %02X\n",
+		s->cart_bank,
+		s->grom_latch,
+		s->grom_last,
+		s->ga,
+		s->keyboard_row,
+		s->timer_mode,
+		s->alpha_lock,
+		s->vdp.a,
+		s->vdp.latch,
+		s->vdp.y,
+		s->vdp.reg[0],
+		s->vdp.reg[1],
+		s->vdp.reg[2],
+		s->vdp.reg[3],
+		s->vdp.reg[4],
+		s->vdp.reg[5],
+		s->vdp.reg[6],
+		s->vdp.reg[7],
+		s->vdp.reg[VDP_ST]);
+	for (i = 0; i < 16*1024/16; i++) {
+		u8 *p = s->vdp.ram+i*16;
+		fprintf(f, "V%04X: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			i*16,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+	}
+	for (i = 0; i < 32*1024; i+=16) {
+		u16 *p = s->ram+(i/2);
+		fprintf(f, "%04X: %04x %04x %04x %04x  %04x %04x %04x %04x\n",
+			(i<8192 ? 0x2000 : 0xa000-8192)+i,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+	}
 }
 
 
@@ -214,10 +302,11 @@ int undo_pop(void)
 		if (undo_head-- == 0) { // wrap around
 			undo_head = ARRAY_SIZE(undo_buffer)-1;
 		}
-		unsigned int v = undo_buffer[undo_head];
-		unsigned int w = undo_buffer[undo_head] & 0xffff;
+		unsigned int u = undo_buffer[undo_head];
+		u16 v = u >> 16;
+		u16 w = u & 0xffff;
 		//printf("undo %04x %04x\n", v>>16, w);
-		switch (v >> 16) {
+		switch (v) {
 		case UNDO_PC: set_pc(w); return 0;
 		case UNDO_WP: set_wp(w); break;
 		case UNDO_ST: set_st(w); break;
@@ -225,7 +314,7 @@ int undo_pop(void)
 		case UNDO_VDPA: vdp.a = w; break;
 		case UNDO_VDPD: /* ??? */ break;
 		case UNDO_VDPL: vdp.latch = w & 1; break;
-		case UNDO_VDPST: vdp.reg[8] = w; break;
+		case UNDO_VDPST: vdp.reg[VDP_ST] = w; break;
 		case UNDO_VDPY: vdp.y = w; break;
 		case UNDO_VDPR: vdp.reg[(w>>8)] = w&0xff; break;
 		case UNDO_GA: ga = w; break;
@@ -234,15 +323,16 @@ int undo_pop(void)
 		case UNDO_CB: cart_bank = w; break;
 		case UNDO_KB: keyboard_row = w; break;
 		default:
-			if (((v>>16) & 0xc000) == UNDO_EXPRAM) {
-				ram[(v>>16) & 0x7fff] = w;
-			} else if (((v>>16) & 0xf000) == UNDO_VDPRAM) {
-				vdp.ram[(v>>8) & 0x3fff] = w&0xff;
-			} else if (((v>>16) & 0xff80) == UNDO_CPURAM) {
-				//printf("fast_ram[%02x]=%04x\n", (v>>16) & 0x7f, w);
-				fast_ram[(v>>16) & 0x7f] = w;
+			if ((v & 0xc000) == UNDO_EXPRAM) {
+				//printf("undo exp a=%x w=%04X\n", v&0x3fff, w);
+				ram[v & 0x3fff] = w;
+			} else if ((v & 0xf000) == UNDO_VDPRAM) {
+				vdp.ram[(u>>8) & 0x3fff] = u & 0xff;
+			} else if ((v & 0xff80) == UNDO_CPURAM) {
+				//printf("fast_ram[%02x]=%04x\n", v & 0x7f, w);
+				fast_ram[v & 0x7f] = w;
 			} else {
-				printf("unhandled undo %04x %04x\n", v>>16, w);
+				printf("unhandled undo %04x %04x\n", v, w);
 			}
 			break;
 		}
@@ -251,6 +341,8 @@ int undo_pop(void)
 	return -1;
 }
 
+// returns a list of PCs and cycle counts from the undo stack
+// this is used to show the debugger instruction trace window with cycle counts
 void undo_pcs(u16 *pcs, u8 *cycs, int count)
 {
 	int idx = 0;
@@ -287,6 +379,8 @@ void undo_push(u16 op, unsigned int value)
 	}
 }
 
+// This is used to update the last cycle count pushed,
+// after the instruction has finished executing
 void undo_fix_cyc(u16 cyc)
 {
 	unsigned int i = undo_head;
@@ -305,6 +399,17 @@ void undo_fix_cyc(u16 cyc)
 
 #endif
 
+unsigned int get_total_cpu_cycles(void)
+{
+	// The total cycles and current cycle count are updated independently
+	// at the end of each scan line.  So this could lead to a race condition
+	// where they are temporarily out of sync while both are updated.
+	// The 'busy' variable is set to the correct value during this update sequence and cleared after.
+	if (total_cycles_busy)
+		return total_cycles_busy;
+	// otherwise combine 'total_cycles' and current cycle counter
+	return total_cycles + add_cyc(0);
+}
 
 
 /******************************************
@@ -367,13 +472,14 @@ static u16 vdp_8800_r(u16 address)
 	vdp.latch = 0;
 	if (address == 0x8800) {
 		// 8800   VDP RAM read data register
+		undo_push(UNDO_VDPA, vdp.a);
 		return vdp.ram[vdp.a++ & 0x3fff] << 8;
 	} else if (address == 0x8802) {
 		// 8802   VDP RAM read status register
-		u16 value = vdp.reg[8] << 8;
-		//debug_log("VDP_STATUS=%0x\n", vdp.reg[8]);
-		undo_push(UNDO_VDPST, vdp.reg[8]);
-		vdp.reg[8] &= ~0xE0; // clear interrupt flags
+		u16 value = vdp.reg[VDP_ST] << 8;
+		//debug_log("VDP_STATUS=%0x\n", vdp.reg[VDP_ST]);
+		undo_push(UNDO_VDPST, vdp.reg[VDP_ST]);
+		vdp.reg[VDP_ST] &= ~0xE0; // clear interrupt flags
 		interrupt(-1); // deassert INTREQ
 		return value;
 	}
@@ -390,7 +496,7 @@ static u16 vdp_8800_safe_r(u16 address)
 		return vdp.ram[vdp.a & 0x3fff] << 8;
 	} else if (address == 0x8802) {
 		// 8802   VDP RAM read status register
-		return vdp.reg[8] << 8;
+		return vdp.reg[VDP_ST] << 8;
 	}
 	debug_log("unhandled RAM read %04X at PC=%04X\n", address, get_pc());
 	return 0;
@@ -429,9 +535,11 @@ static void vdp_8c00_w(u16 address, u16 value)
 		// 8C00   VDP RAM write data register
 		//debug_log("VDP write %04X = %02X\n", vdp.a, value >> 8);
 		undo_push(UNDO_VDPA, vdp.a);
+		undo_push(UNDO_VDPL, vdp.latch);
 		undo_push(UNDO_VDPRAM, (vdp.a << 8) | vdp.ram[vdp.a]);
 		vdp.ram[vdp.a] = value >> 8;
 		vdp.a = (vdp.a + 1) & 0x3fff; // wraps at 16K
+		vdp.latch = 0;
 		return;
 	} else if (address == 0x8C02) {
 		// 8C02   VDP RAM write address register
@@ -694,6 +802,15 @@ static void cart_rom_w(u16 address, u16 value)
  * 2000-3FFF,A000-FFFF  Expansion RAM   *
  ****************************************/
 
+// extra indirection for undo
+static void exp_w(u16 address, u16 value)
+{
+	u16 a = (address < 0xa000 ? address - 0x2000 : address - 0x8000) >> 1;
+	//printf("%s: a=%x ram[a]=%04X address=%04X value=%04X\n",
+	//		__func__, a, ram[a], address, value);
+	undo_push(UNDO_EXPRAM + a, ram[a]);
+	map_w(address, value);
+}
 
 static u16 zero_r(u16 address)
 {
@@ -721,7 +838,7 @@ static void mem_init(void)
 	set_mapping(0x0000, 0x2000, rom_r, rom_w, NULL);
 
 	// low memory expansion 2000-3fff
-	set_mapping(0x2000, 0x2000, map_r, map_w, ram);
+	set_mapping(0x2000, 0x2000, map_r, exp_w, ram);
 
 	// DSR ROM 4000-5fff
 	set_mapping(0x4000, 0x2000, zero_r, zero_w, NULL);
@@ -740,7 +857,7 @@ static void mem_init(void)
 	set_mapping(0x9c00, 0x400, zero_r, grom_9c00_w, NULL);
 
 	// high memory expansion A000-ffff
-	set_mapping(0xa000, 0x6000, map_r, map_w, ram+(0x2000/2));
+	set_mapping(0xa000, 0x6000, map_r, exp_w, ram+(0x2000/2));
 
 	// instruction aquisition func
 	//iaq_func = mem_r;
@@ -874,16 +991,19 @@ int char2key(char ch)
  * CRU read/write                       *
  ****************************************/
 
+static u32 sampled_timer_value = 0;
+
 u8 cru_r(u16 bit)
 {
+
 	if (timer_mode && bit >= 1 && bit <= 14) {
 
-		return ((total_cycles+add_cyc(0)) >> (14-bit)) & 1;
+		return (sampled_timer_value >> (14-bit)) & 1;
 	}
 	switch (bit) {
 	case 0: return timer_mode;
-	case 2: //debug_log("VDPST=%02X\n", vdp.reg[8]);
-		return !(vdp.reg[8] & 0x80);
+	case 2: //debug_log("VDPST=%02X\n", vdp.reg[VDP_ST]);
+		return !(vdp.reg[VDP_ST] & 0x80);
 	case 3: //     = . , M N / fire1 fire2
 	case 4: // space L K J H ;
 	case 5: // enter O I U Y P
@@ -908,6 +1028,7 @@ void cru_w(u16 bit, u8 value)
 	switch (bit) {
 	case 0: // 0=normal 1=timer
 		timer_mode = value & 1;
+		if (timer_mode) sampled_timer_value = get_total_cpu_cycles() >> 5;
 		debug_log("timer_mode=%d\n", timer_mode);
 		break;
 	case 1:
@@ -977,17 +1098,20 @@ void unhandled(u16 pc, u16 op)
 // YUV to RGB for analog TV
 #define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.000*Y               +1.140*(Cb-0.5))*255)<<16) | \
                           ((int)(CLAMP(1.000*Y-0.395*(Cr-0.5)-0.581*(Cb-0.5))*255)<<8)  | \
-			  ((int)(CLAMP(1.000*Y+2.032*(Cr-0.5)               )*255)))
+			  ((int)(CLAMP(1.000*Y+2.032*(Cr-0.5)               )*255)))	| \
+			  0xff000000
 #elif 0
 // YCbCr to RGB for SDTV
 #define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.164*Y               +1.596*(Cb-0.5))*255)<<16) | \
                           ((int)(CLAMP(1.164*Y-0.392*(Cr-0.5)-0.813*(Cb-0.5))*255)<<8)  | \
-			  ((int)(CLAMP(1.164*Y+2.017*(Cr-0.5)               )*255)))
+			  ((int)(CLAMP(1.164*Y+2.017*(Cr-0.5)               )*255)))	| \
+			  0xff000000
 #elif 0
 // Full-range YCbCr to RGB for SDTV
 #define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.000*Y               +1.400*(Cb-0.5))*255)<<16) | \
                           ((int)(CLAMP(1.000*Y-0.343*(Cr-0.5)-0.711*(Cb-0.5))*255)<<8)  | \
-			  ((int)(CLAMP(1.000*Y+1.765*(Cr-0.5)               )*255)))
+			  ((int)(CLAMP(1.000*Y+1.765*(Cr-0.5)               )*255)))	| \
+			  0xff000000
 #endif
 
 unsigned int palette[16] = {
@@ -1080,12 +1204,154 @@ unsigned int palette[16] = {
 
 static int config_sprites_per_line = SPRITES_PER_LINE;
 
+enum {
+	MODE_1_STANDARD = 0,
+	MODE_2_BITMAP = 2,
+	MODE_8_MULTICOLOR = 8,
+	MODE_10_TEXT = 0x10,
+	MODE_12_TEXT_BITMAP = 0x12,
+	MODE_SPRITES = 0x20,
+};
+
+static void draw_char_patterns(
+	uint32_t *pixels,
+	unsigned int sy,
+	unsigned char *scr,
+	unsigned char mode,
+	unsigned char *reg,
+	unsigned char *ram,
+	int bord,
+	int len)
+{
+	uint32_t bg = palette[reg[7] & 0xf];
+	uint32_t fg = palette[(reg[7] >> 4) & 0xf];
+	unsigned char *col = ram + reg[3] * 0x40;
+	unsigned char *pat = ram + (reg[4] & 0x7) * 0x800 + (sy & 7);
+
+	if (mode == MODE_1_STANDARD) {
+		// mode 1 (standard)
+		scr += (sy / 8) * 32;
+
+		for (unsigned char i = 32; i; i--) {
+			unsigned char
+				ch = *scr++,
+				c = col[ch >> 3];
+			unsigned int
+				fg = palette[c >> 4],
+				bg = palette[c & 15];
+			ch = pat[ch * 8];
+			for (unsigned char j = 0x80; j; j >>= 1)
+				*pixels++ = ch & j ? fg : bg;
+		}
+	} else if (mode & MODE_10_TEXT) {
+		unsigned char i = len == 640 ? 80 : 40;
+		// text mode(s)
+		scr += (sy / 8) * i;
+		for (int i = 0; i < bord/4; i++) {
+			*pixels++ = bg;
+		}
+		if (mode == MODE_10_TEXT) {
+			for (; i; i--) {
+				unsigned char ch = *scr++;
+				ch = pat[ch * 8];
+				for (unsigned char j = 0x80; j != 2; j >>= 1)
+					*pixels++ = ch & j ? fg : bg;
+			}
+		} else if (mode == MODE_12_TEXT_BITMAP) { // text bitmap
+			unsigned int patmask = ((reg[4]&3)<<11)|(0x7ff);
+			pat = ram + (reg[4] & 0x04) * 0x800 +
+				(((sy / 64) * 2048) & patmask) + (sy & 7);
+			for (; i; i--) {
+				unsigned char ch = *scr++;
+				ch = pat[ch * 8];
+				for (unsigned char j = 0x80; j != 2; j >>= 1)
+					*pixels++ = ch & j ? fg : bg;
+			}
+		} else { // illegal mode (40 col, 4px fg, 2px bg)
+			for (; i; i--) {
+				*pixels++ = fg;
+				*pixels++ = fg;
+				*pixels++ = fg;
+				*pixels++ = fg;
+				*pixels++ = bg;
+				*pixels++ = bg;
+			}
+		}
+		for (int i = 0; i < bord/4; i++) {
+			*pixels++ = bg;
+		}
+
+	} else if (mode == MODE_2_BITMAP) {
+		// mode 2 (bitmap)
+
+		// masks for hybrid modes
+		unsigned int colmask = ((reg[3] & 0x7f) << 6) | 0x3f;
+		unsigned int patmask = ((reg[4] & 3) << 11) | (colmask & 0x7ff);
+
+		scr += (sy / 8) * 32;  // get row
+
+		col = ram + (reg[3] & 0x80) * 0x40 +
+			(((sy / 64) * 2048) & colmask) + (sy & 7);
+		pat = ram + (reg[4] & 0x04) * 0x800 +
+			(((sy / 64) * 2048) & patmask) + (sy & 7);
+
+		// TODO handle bitmap modes
+		for (unsigned char i = 32; i; i--) {
+			unsigned char
+				ch = *scr++,
+				c = col[(ch & patmask) * 8];
+			uint32_t
+				fg = palette[c >> 4],
+				bg = palette[c & 15];
+			ch = pat[(ch & colmask) * 8];
+			for (unsigned char j = 0x80; j; j >>= 1)
+				*pixels++ = ch & j ? fg : bg;
+		}
+	} else if (mode == MODE_8_MULTICOLOR) {
+		// multicolor 64x48 pixels
+		pat -= (sy & 7); // adjust y offset
+		pat += ((sy / 4) & 7);
+
+		scr += (sy / 8) * 32;  // get row
+
+		for (unsigned char i = 32; i; i--) {
+			unsigned char
+				ch = *scr++,
+				c = pat[ch * 8];
+			uint32_t
+				fg = palette[c >> 4],
+				bg = palette[c & 15];
+			for (unsigned char j = 0; j < 4; j++)
+				*pixels++ = fg;
+			for (unsigned char j = 0; j < 4; j++)
+				*pixels++ = bg;
+		}
+
+	} else if (mode == MODE_SPRITES) {
+		// sprite patterns - debug only 
+		unsigned char *sp = ram + (reg[6] & 0x7) * 0x800 // sprite pattern table
+			+ (sy & 7);
+		scr += (sy / 8) * 32;
+		fg = palette[15];
+		bg = palette[1];
+
+		for (unsigned char i = 32; i; i--) {
+			unsigned char ch = *scr++;
+			ch = sp[ch * 8];
+			for (unsigned char j = 0x80; j; j >>= 1)
+				*pixels++ = ch & j ? fg : bg;
+		}
+
+
+	}
+}
+
+
 void vdp_line(unsigned int line,
 		unsigned char* restrict reg,
 		unsigned char* restrict ram)
 {
 	uint32_t *pixels;
-	int pitch = 0;
 	int len = 320;
 	int bord = LFTBORD;
 	uint32_t bg = palette[reg[7] & 0xf];
@@ -1099,7 +1365,7 @@ void vdp_line(unsigned int line,
 		bord *= 2;
 	}
 
-	vdp_lock_texture(line, len, (void**)&pixels, &pitch);
+	vdp_lock_texture(line, len, (void**)&pixels);
 
 	if (line < TOPBORD || line >= TOPBORD+192 || (reg[1] & 0x40) == 0) {
 		// draw border or blanking
@@ -1109,8 +1375,7 @@ void vdp_line(unsigned int line,
 	} else {
 		unsigned int sy = line - TOPBORD; // screen y, adjusted for border
 		unsigned char *scr = ram + (reg[2] & 0xf) * 0x400;
-		unsigned char *col = ram + reg[3] * 0x40;
-		unsigned char *pat = ram + (reg[4] & 0x7) * 0x800 + (sy & 7);
+		unsigned char mode = (reg[0] & 0x02) | (reg[1] & 0x18);
 
 		// draw left border
 		for (int i = 0; i < bord; i++) {
@@ -1120,108 +1385,8 @@ void vdp_line(unsigned int line,
 		uint32_t *save_pixels = pixels;
 
 		// draw graphics
-		unsigned char mode = (reg[0] & 0x02) | (reg[1] & 0x18);
-
-		if (mode == 0x0) {
-			// mode 1 (standard)
-			scr += (sy / 8) * 32;
-
-			for (unsigned char i = 32; i; i--) {
-				unsigned char
-					ch = *scr++,
-					c = col[ch >> 3];
-				unsigned int
-					fg = palette[c >> 4],
-					bg = palette[c & 15];
-				ch = pat[ch * 8];
-				for (unsigned char j = 0x80; j; j >>= 1)
-					*pixels++ = ch & j ? fg : bg;
-			}
-		} else if (mode & 0x10) {
-			unsigned char i = len == 640 ? 80 : 40;
-			// text mode(s)
-			scr += (sy / 8) * i;
-			for (int i = 0; i < bord/4; i++) {
-				*pixels++ = bg;
-			}
-			if (mode == 0x10) {
-				for (; i; i--) {
-					unsigned char ch = *scr++;
-					ch = pat[ch * 8];
-					for (unsigned char j = 0x80; j != 2; j >>= 1)
-						*pixels++ = ch & j ? fg : bg;
-				}
-			} else if (mode == 0x12) { // text bitmap
-				unsigned int patmask = ((reg[4]&3)<<11)|(0x7ff);
-				pat = ram + (reg[4] & 0x04) * 0x800 +
-					(((sy / 64) * 2048) & patmask) + (sy & 7);
-				for (; i; i--) {
-					unsigned char ch = *scr++;
-					ch = pat[ch * 8];
-					for (unsigned char j = 0x80; j != 2; j >>= 1)
-						*pixels++ = ch & j ? fg : bg;
-				}
-			} else { // illegal mode (40 col, 4px fg, 2px bg)
-				for (; i; i--) {
-					*pixels++ = fg;
-					*pixels++ = fg;
-					*pixels++ = fg;
-					*pixels++ = fg;
-					*pixels++ = bg;
-					*pixels++ = bg;
-				}
-			}
-			for (int i = 0; i < bord/4; i++) {
-				*pixels++ = bg;
-			}
-
-		} else if (mode == 0x02) {
-			// mode 2 (bitmap)
-
-			// masks for hybrid modes
-			unsigned int colmask = ((reg[3] & 0x7f) << 6) | 0x3f;
-			unsigned int patmask = ((reg[4] & 3) << 11) | (colmask & 0x7ff);
-
-			scr += (sy / 8) * 32;  // get row
-
-			col = ram + (reg[3] & 0x80) * 0x40 +
-				(((sy / 64) * 2048) & colmask) + (sy & 7);
-			pat = ram + (reg[4] & 0x04) * 0x800 +
-				(((sy / 64) * 2048) & patmask) + (sy & 7);
-
-			// TODO handle bitmap modes
-			for (unsigned char i = 32; i; i--) {
-				unsigned char
-					ch = *scr++,
-					c = col[(ch & patmask) * 8];
-				unsigned int
-					fg = palette[c >> 4],
-					bg = palette[c & 15];
-				ch = pat[(ch & colmask) * 8];
-				for (unsigned char j = 0x80; j; j >>= 1)
-					*pixels++ = ch & j ? fg : bg;
-			}
-		} else if (mode == 0x08) {
-			// multicolor 64x48 pixels
-			pat -= (sy & 7); // adjust y offset
-			pat += ((sy / 4) & 7);
-
-			scr += (sy / 8) * 32;  // get row
-
-			for (unsigned char i = 32; i; i--) {
-				unsigned char
-					ch = *scr++,
-					c = pat[ch * 8];
-				unsigned int
-					fg = palette[c >> 4],
-					bg = palette[c & 15];
-				for (unsigned char j = 0; j < 4; j++)
-					*pixels++ = fg;
-				for (unsigned char j = 0; j < 4; j++)
-					*pixels++ = bg;
-			}
-
-		}
+		draw_char_patterns(pixels, sy, scr, mode, reg, ram, bord, len);
+		pixels += len - 2 * bord;
 
 		// draw right border
 		for (int i = 0; i < bord; i++) {
@@ -1352,10 +1517,9 @@ static void print_name_table(u8* reg, u8 *ram)
 
 static uint32_t frame_buffer[320*240];
 
-void vdp_lock_texture(int line, int len, void**pixels, int *pitch)
+void vdp_lock_texture(int line, int len, void**pixels)
 {
 	*pixels = frame_buffer + line*320;
-	*pitch = 320;
 }
 void vdp_unlock_texture(void)
 {
@@ -1470,8 +1634,8 @@ static int load_rom(char *filename, u16 **dest_ptr, unsigned int *size_ptr)
 		}
 	}
 	if (!f) {
-		debug_log("Failed to open %s\n", filename);
-		fprintf(stderr, "Failed to open %s\n", filename);
+		//debug_log("Failed to open %s\n", filename);
+		//fprintf(stderr, "Failed to open %s\n", filename);
 		return -1; //exit(1);
 	}
 	if (fseek(f, 0, SEEK_END) < 0)
@@ -1502,7 +1666,7 @@ static int load_rom(char *filename, u16 **dest_ptr, unsigned int *size_ptr)
 		*dest++ = buf[1] + (buf[0] << 8);
 	}
 	fclose(f);
-	printf("loaded ROM %d/%d\n", i, size);
+	//printf("loaded ROM %d/%d\n", i, size);
 	return i < size ? -1 : 0;
 }
 
@@ -1528,9 +1692,9 @@ static int load_grom(char *filename, u8 **dest_ptr, unsigned int *size_ptr)
 		}
 	}
 	if (!f) {
-		debug_log("Failed to open %s\n", filename);
-		fprintf(stderr, "Failed to open %s\n", filename);
-		return -1; //exit(1);
+		//debug_log("Failed to open %s\n", filename);
+		//fprintf(stderr, "Failed to open %s\n", filename);
+		return -1;
 	}
 	if (fseek(f, 0, SEEK_END) < 0)
 		perror("fseek SEEK_END");
@@ -1821,6 +1985,7 @@ void reset(void)
  	ga = 0xb5b5; // grom address
 	grom_last = 0xaf;
 
+
 #ifdef ENABLE_UNDO
 	undo_head = 0; undo_tail = 0;
 #endif
@@ -1859,13 +2024,15 @@ void reset(void)
 			unsigned int banks = (cart_rom_size + 0x1fff) >> 13;
 
 			// get next power of 2
-			//cart_bank_mask = banks ? (1 << (32-__builtin_clz(banks))) - 1 : 0;
+			cart_bank_mask = banks>1 ? (1 << (32-__builtin_clz(banks-1))) - 1 : 0;
+#if 0
 			cart_bank_mask = banks-1;
 			cart_bank_mask |= cart_bank_mask >> 1;
 			cart_bank_mask |= cart_bank_mask >> 2;
 			cart_bank_mask |= cart_bank_mask >> 4;
 			cart_bank_mask |= cart_bank_mask >> 8;
 			cart_bank_mask |= cart_bank_mask >> 16;
+#endif
 
 			printf("cart_bank_mask = 0x%x (size=%d banks=%d) page_size=%d\n",
 				cart_bank_mask, cart_rom_size, banks, 256/*1<<MAP_SHIFT*/);
@@ -1880,18 +2047,18 @@ void reset(void)
 			memcpy(name, cartridge_name, len + 1);
 			name[len-5] = isupper(name[len-5]) ? 'G' : 'g';
 
-			printf("load grom %s\n", name);
+			//printf("load grom %s\n", name);
 		        if (load_grom(name, &cart_grom, &cart_grom_size) == -1) {
 				// try insert G otherwise
 				memcpy(name, cartridge_name, len + 1);
 				memmove(name+len-3, name+len-4, 5); // move the .bin
 				name[len-4] = isupper(name[len-5]) ? 'G' : 'g';
 
-				printf("load grom %s\n", name);
+				//printf("load grom %s\n", name);
 				load_grom(name, &cart_grom, &cart_grom_size);
 			}
 			free(name);
-			printf("grom=%p size=%u\n", cart_grom, cart_grom_size);
+			//printf("grom=%p size=%u\n", cart_grom, cart_grom_size);
 		}
 #ifndef TEST
 		// optionally load listing
@@ -1902,7 +2069,7 @@ void reset(void)
 			name[len-3] ^= 'b' ^ 'l';
 			name[len-2] ^= 'i' ^ 's';
 			name[len-1] ^= 'n' ^ 't';
-			printf("load listing %s\n", name);
+			//printf("load listing %s\n", name);
 			load_listing(name, -1);
 			free(name);
 		}
@@ -1929,7 +2096,7 @@ int vdp_update_or_menu(void)
 	return 0;
 }
 
-
+int debug_pattern_type = 0; // 0-2=pattern tables 3=sprite table
 void update_debug_window(void)
 {
 	char reg[53*30] = { [0 ... 53*30-1]=32};
@@ -1950,7 +2117,7 @@ void update_debug_window(void)
 		"  KB: %02X %02X %02X %02X %02X %02X %02X %02X\n\n"
 		"\n                                          \n",
 		vdp.reg[0], vdp.a, safe_r(wp), safe_r(wp+16),
-		vdp.reg[1], vdp.reg[8], safe_r(wp+2), safe_r(wp+18),
+		vdp.reg[1], vdp.reg[VDP_ST], safe_r(wp+2), safe_r(wp+18),
 		vdp.reg[2], safe_r(wp+4), safe_r(wp+20),
 		vdp.reg[3], get_pc(), safe_r(wp+6), safe_r(wp+22),
 		vdp.reg[4], wp, safe_r(wp+8), safe_r(wp+24),
@@ -1994,26 +2161,107 @@ void update_debug_window(void)
 		vdp.reg[6], safe_r(wp+20),
 		vdp.reg[7], safe_r(wp+22),
 		vdp.a,      safe_r(wp+24),
-		vdp.reg[8], safe_r(wp+26),
+		vdp.reg[VDP_ST], safe_r(wp+26),
 		vdp.y,	    safe_r(wp+28),
 		cart_bank,  safe_r(wp+30),
 		keyboard_row,
 		keyboard[0], keyboard[1], keyboard[2], keyboard[3],
 		keyboard[4], keyboard[5], keyboard[6], keyboard[7]);
 		vdp_text_window(reg, 23,30, 0,240, -1);
+	}
+	// show fast ram state
+	int i, n = 0;
+	for (i = 0; i < 128; i+=8) {
+		n += sprintf(reg+n, "  %04X:  %04X %04X %04X %04X  %04X %04X %04X %04X\n",
+			0x8300+i*2, fast_ram[i], fast_ram[i+1], fast_ram[i+2], fast_ram[i+3],
+			fast_ram[i+4], fast_ram[i+5], fast_ram[i+6], fast_ram[i+7]);
+	}
+	reg[n] = 0;
+	vdp_text_window(reg, 53,30, 322,0, -1);
 
-		// show fast ram state
-		int i, n = 0;
-		for (i = 0; i < 128; i+=8) {
-			n += sprintf(reg+n, "  %04X:  %04X %04X %04X %04X  %04X %04X %04X %04X\n",
-				0x8300+i*2, fast_ram[i], fast_ram[i+1], fast_ram[i+2], fast_ram[i+3],
-				fast_ram[i+4], fast_ram[i+5], fast_ram[i+6], fast_ram[i+7]);
+	// draw char patterns 
+	{
+		unsigned char scr[32*24], save_r4 = vdp.reg[4];
+		void *pixels;
+		unsigned char mode = (vdp.reg[0] & 0x02) | (vdp.reg[1] & 0x18);
+		unsigned char sp_size = 0;
+		int i, y_offset = debug_pattern_type * 64;
+
+		if (debug_pattern_type == 3) {
+			y_offset = 0;
+			mode = MODE_SPRITES;
+			sp_size = (vdp.reg[1] & 2) >> 1; // 0=8pix 1=16pix
 		}
-		reg[n] = 0;
-		vdp_text_window(reg, 53,30, 322,0, -1);
+
+		for (i = 0; i < 32*24; i++) {
+			// linear, otherwise 02/13 layout for 16x16 sprites
+			scr[i] = !sp_size ? i : ((i & 0xc0)|((i&31)<<1)|((i>>5)&1));
+		}
+		if (sp_size) {
+			static int once = 1;
+			if (once) {
+				once = 0;
+				for (i = 0; i < 32*8; i++) {
+					printf("%02x ", scr[i]);
+					if ((i & 31) == 31) printf("\n");
+				}
+			}
+
+		}
+
+		for (i = 0; i < 8*8; i++) {
+			vdp_lock_debug_texture(i+16*8, 640, &pixels);
+			draw_char_patterns(((uint32_t*)pixels) + 320+32,
+				i+y_offset, scr, mode, vdp.reg, vdp.ram, 32, 320);
+			vdp_unlock_debug_texture();
+		}
+		vdp_text_window(&"1\n2\n3\nS\n"[debug_pattern_type*2], 1,1, 322+3*6,16*8, -1);
 	}
 }
 
+
+static void emu_check_undo(void)
+{
+	struct state s0, s1, s2;
+
+	save_state(&s0);
+	do {
+		u16 save_pc = get_pc();
+
+		single_step();
+		save_state(&s1);
+		undo_pop();
+		save_state(&s2);
+		if (memcmp(&s0, &s2, sizeof(struct state)) != 0) {
+			FILE *f;
+			printf("undo failed at pc=%04x\n", save_pc);
+			f = fopen("bulwip_undo0.txt", "w");
+			print_state(f, &s0);
+			//fwrite(&s0, sizeof(struct state), 1, f);
+			fclose(f);
+			f = fopen("bulwip_undo1.txt", "w");
+			print_state(f, &s2);
+			//fwrite(&s2, sizeof(struct state), 1, f);
+			fclose(f);
+			exit(0);
+		}
+		single_step(); // redo
+		save_state(&s0);
+		if (memcmp(&s0, &s1, sizeof(struct state)) != 0) {
+			FILE *f;
+			printf("redo failed at pc=%04x\n", save_pc);
+			f = fopen("bulwip_undo0.txt", "w");
+			print_state(f, &s0);
+			//fwrite(&s0, sizeof(struct state), 1, f);
+			fclose(f);
+			f = fopen("bulwip_undo1.txt", "w");
+			print_state(f, &s2);
+			//fwrite(&s2, sizeof(struct state), 1, f);
+			fclose(f);
+			exit(0);
+		}
+	} while (add_cyc(0) < 0);
+}
 
 
 
@@ -2107,10 +2355,11 @@ int main(int argc, char *argv[])
 		do {
 			// render one scanline
 			if (vdp.y < 240) {
+				undo_push(UNDO_VDPST, vdp.reg[VDP_ST]);
 				vdp_line(vdp.y, vdp.reg, vdp.ram);
 			} else if (vdp.y == 246) {
-				undo_push(UNDO_VDPST, vdp.reg[8]);
-				vdp.reg[8] |= 0x80;  // set F in VDP status
+				undo_push(UNDO_VDPST, vdp.reg[VDP_ST]);
+				vdp.reg[VDP_ST] |= 0x80;  // set F in VDP status
 				if (vdp.reg[1] & 0x20) // check IE
 					interrupt(1);  // VDP interrupt
 			}
@@ -2119,14 +2368,17 @@ int main(int argc, char *argv[])
 				vdp.y = 0;
 			}
 
-			total_cycles += CYCLES_PER_LINE;
+			total_cycles_busy = total_cycles + CYCLES_PER_LINE;
+			total_cycles = total_cycles_busy;
 			add_cyc(-CYCLES_PER_LINE);
+			total_cycles_busy = 0;
 			if (debug_break == DEBUG_SINGLE_STEP) {
 				single_step();
 				debug_break = DEBUG_STOP;
 				break;
 			}
 			emu(); // emulate until cycle counter goes positive
+			//emu_check_undo();
 			// a breakpoint will change debug_break variable
 
 		} while (vdp.y != 0 && (debug_break == DEBUG_RUN || debug_break == DEBUG_FRAME_STEP));

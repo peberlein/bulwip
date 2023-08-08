@@ -40,26 +40,65 @@
 #endif
 
 
+
+
+
 void snd_w(unsigned char byte)
 {
 	// FIXME sound bytes should be written to a buffer with cpu clock counts,
 	// so that the register changes can simulated as the audio is generated,
 	// TODO isn't there also a CRU bit that controls audio (cassette tape?)
 	//fprintf(stderr, "sound %02x\n", byte);
-	snd(byte);
+	//snd(byte);
+	snd_fifo(byte, 0, get_total_cpu_cycles());
 }
-static Uint64 next_time = 0;
+
+
+
+static Uint64 next_time = 0; // from SDL_GetPerformanceCounter()
+static int audio_max_delay = 0;    // 50ms, in terms of SDL_GetPerformanceFrequency()
+static int muted = 0;
+
+void mute(int en)
+{
+	muted = en;
+}
 
 static void my_audio_callback(void *userdata, Uint8 *stream, int len)
 {
-	Uint32 now = SDL_GetTicks();
-	int time_left = (next_time >> 32) - now;
-	if (time_left <= -50) {
+	Uint64 now = SDL_GetPerformanceCounter();
+	int time_since_update = now - next_time;
+
+	if (time_since_update > audio_max_delay || muted) {
 		// render loop is paused or window being moved/resized
 		memset(stream, 128, len); // silence
 	} else {
+		static unsigned int rclk = 0; // regen cpu clock but don't overshoot it!
+
+		#define CLKS 32
+		static unsigned int cpu_clks[CLKS] = {0};
+		unsigned int
+			cpu = get_total_cpu_cycles(),
+			//samples = CLKS * len,
+			clocks = cpu - cpu_clks[0];
+
+		rclk += clocks / CLKS;
+		if ((int)(rclk - cpu) > 0) {
+			// overshot available data
+			//printf("overshoot %d\n", (rclk - cpu));
+			rclk = cpu;
+		} else {
+			// adjust closer to prevent drifting too far behind
+			rclk += (int)(cpu - rclk) / 64;  // 63/64 rclk + 1/64 cpu
+		}
+		//printf("cpu clks %d / samples %d, N=%d  rel=%d\n", clocks, samples, 
+		//	clocks / CLKS, rclk - last);
+
+		memmove(cpu_clks, cpu_clks+1, sizeof(cpu_clks)-sizeof(cpu_clks[0]));
+		cpu_clks[CLKS-1] = cpu;
+
 		// For AUDIO_U8, len is number of samples to generate
-		update(stream, 0, len);
+		update(stream, 0, len, rclk);
 	}
 }
 
@@ -75,30 +114,50 @@ static void *crt_dest = NULL;
 #endif
 
 // NOTE: pixels is write-only
-void vdp_lock_texture(int line, int len, void**pixels, int *pitch)
+void vdp_lock_texture(int line, int len, void**pixels)
 {
 	texture_len = len; // determines the display width of the texture 
 #ifdef ENABLE_CRT
-	if (config_crt_filter == 2 && crt_src != NULL) {
+	if (cfg.crt_filter == 2 && crt_src != NULL) {
 		*pixels = crt_src + texture_width * 4 * line;
-		*pitch = texture_width * 4;
 	} else
 #endif
 	if (texture) {
+		int pitch;
 		SDL_Rect rect = {0, line, len, 1};
-		SDL_LockTexture(texture, &rect, pixels, pitch);
+		SDL_LockTexture(texture, &rect, pixels, &pitch);
 	}
 }
 
 void vdp_unlock_texture(void)
 {
 #ifdef ENABLE_CRT
-	if (config_crt_filter == 2 && crt_src != NULL) {
+	if (cfg.crt_filter == 2 && crt_src != NULL) {
 		// nothing to do, but don't unlock texture we haven't locked
 	} else
 #endif
 	if (texture) {
 		SDL_UnlockTexture(texture);
+	}
+}
+
+
+static SDL_Texture *debug_texture = NULL;
+
+// NOTE: pixels is write-only
+void vdp_lock_debug_texture(int line, int len, void **pixels)
+{
+	if (debug_texture) {
+		int pitch;
+		SDL_Rect rect = {0, line, len, 1};
+		SDL_LockTexture(debug_texture, &rect, pixels, &pitch);
+	}
+}
+
+void vdp_unlock_debug_texture(void)
+{
+	if (debug_texture) {
+		SDL_UnlockTexture(debug_texture);
 	}
 }
 
@@ -110,7 +169,6 @@ void vdp_text_pat(unsigned char *pat)
 	text_pat = pat;
 }
 
-static SDL_Texture *debug_texture = NULL;
 
 extern unsigned int palette[16]; // bulwip.c
 
@@ -304,7 +362,8 @@ static struct CRT crt;
 #define CRT_H ((480)*1)
 #endif
 
-static Uint64 ticks_per_frame = 0; // actually ticks per frame << 32
+static Uint64 performance_freq = 0; // value returned from SDL_GetPerformanceFrequency()
+static Uint64 ticks_per_frame = 0; // ticks per frame relative to performance_freq
 static int first_tick = 0;
 static unsigned int frames = 0;
 static unsigned int scale_w = 640, scale_h = 480; // window size
@@ -320,7 +379,9 @@ void vdp_set_fps(int mfps /* fps*1000 */)
 	} else {
 		// This can be used to set frame rate to a more exact fraction
 		// Or with another divider to speed up/slow down emulation
-		ticks_per_frame = ((Uint64)1000000 << 32) / mfps;
+		//ticks_per_frame = ((Uint64)1000000 << 32) / mfps;
+		ticks_per_frame = performance_freq * 1000 / mfps;
+		//printf("ticks_per_frame=%llu  PF=%llu\n", ticks_per_frame, performance_freq);
 	}
 }
 
@@ -335,7 +396,7 @@ void vdp_window_scale(int scale)
 void vdp_set_filter(void)
 {
 	if (texture) SDL_DestroyTexture(texture);
-	if (config_crt_filter == 0) {
+	if (cfg.crt_filter == 0) {
 		SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
 	} else {
 		SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
@@ -382,7 +443,7 @@ void vdp_init(void)
 
 		renderer = SDL_CreateRenderer(window, -1, 0);
 
-		config_crt_filter = 0;
+		cfg.crt_filter = 0;
 		vdp_set_filter(); // this creates the "texture" texture
 
 		debug_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
@@ -403,6 +464,8 @@ void vdp_init(void)
 		}
 	}
 	first_tick = SDL_GetTicks();
+	performance_freq = SDL_GetPerformanceFrequency();
+	audio_max_delay = 50/*ms*/ * performance_freq / 1000;
 
 	vdp_set_fps(NTSC_FPS);
 	vdp_text_clear(0, 0, 640/6+1, 480/8, AMSK); // clear debug window
@@ -597,7 +660,7 @@ int vdp_update(void)
 
 			case SDLK_F11: if (kdn) SDL_SetWindowFullscreen(window, (config_fullscreen ^= SDL_WINDOW_FULLSCREEN)); break;
 			case SDLK_F12: if (!kdn) break; if (mod & KMOD_CTRL) reset(); else debug_en =! debug_en; break;
-			//case SDLK_F5: if (kdn) config_crt_filter = (config_crt_filter + 1) % 3; vdp_set_filter(); break;
+			//case SDLK_F5: if (kdn) cfg.crt_filter = (cfg.crt_filter + 1) % 3; vdp_set_filter(); break;
 			default: break;
 			}
 
@@ -648,7 +711,7 @@ int vdp_update(void)
 		SDL_Rect dst = {.x = 0, .y = 0, .w = scale_w, .h = scale_h};
 
 #ifdef ENABLE_CRT
-		if (config_crt_filter == 2) {
+		if (cfg.crt_filter == 2) {
 			struct NTSC_SETTINGS ntsc = {
 				.w = src.w,
 				.h = src.h - 4,  // FIXME: why does this fix blurry lines?
@@ -703,28 +766,30 @@ int vdp_update(void)
 			SDL_RenderCopy(renderer, debug_texture, &src, NULL);
 		}
 
+
 		// TODO use SDL_GetTicks() to determine actual framerate and 
 		// dupe/drop frames to achieve desired VDP freq
 		SDL_RenderPresent(renderer);
-		if (ticks_per_frame != 0) { // cap frame rate, approximately
-			Uint32 now = SDL_GetTicks();
-			int time_left = (next_time >> 32) - now;
 
-			if (next_time == 0 || time_left <= 0) {
-				next_time = ((Uint64)now << 32);
+		if (ticks_per_frame != 0) { // cap frame rate, approximately
+			Uint64 now = SDL_GetPerformanceCounter();
+			Uint64 time_left = (int)(next_time - now);
+
+			// if first time, or large difference (possibly negative)
+			if (next_time == 0 || time_left > performance_freq) {
+				next_time = now;
 			} else {
-				SDL_Delay(time_left);
+				unsigned int delay = time_left * 1000 / performance_freq;
+				SDL_Delay(delay);
 			}
 			next_time += ticks_per_frame;
-		} else {
-			// still needed for my_audio_callback()
-			next_time = ((Uint64)SDL_GetTicks() << 32);
 		}
 		frames++;
 		//if (frames == 600) {
 		//	fprintf(stderr, "600 frames %f fps\n", frames*1000.0/(SDL_GetTicks()-first_tick));
 		//	return -1;
 		//}
+
 	}
 	return 0;
 }
