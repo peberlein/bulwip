@@ -43,6 +43,7 @@ While debugger is open:
 - R: Register select, then Enter to jump to address
 - Z: Reverse instruction step
 - Shift-Z: Reverse instruction step until PC goes lower (good for rewinding out of a loop)
+- 1/2/3/S: Show character pattern tables, or sprite pattern table
 - TODO Ctrl->B: Go to referenced label
 
 
