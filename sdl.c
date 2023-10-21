@@ -353,6 +353,48 @@ void vdp_draw_graph(double *array)
 	SDL_UnlockTexture(debug_texture);
 }
 
+static void set_window_icon(SDL_Window *window)
+{
+	SDL_Surface *surface;
+	int x, y;
+
+	surface = SDL_CreateRGBSurface(0, 16, 16, 32, RMSK, GMSK, BMSK, AMSK);
+
+	{	u8 pat[] = { //                |
+			 0, 0, 0, 0, 0, 0, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0,
+			 0, 0, 0, 6, 6, 6, 6, 0, 0, 6, 6, 0, 0, 0, 0, 0,
+			 0, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0,
+			 6,11, 6, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0,
+			11,11,11, 0, 0, 0, 5, 5, 5, 0, 0, 0, 6, 0, 0, 0, 
+			11,11, 0, 0, 0, 0, 5, 5, 5, 0, 0, 0, 6, 0, 0, 0, 
+			 6, 6, 0, 0, 5, 5, 4, 4, 4, 5, 5, 0, 6, 0, 0, 0, 
+			 6,11, 0, 5, 4, 4, 5, 5, 5, 4, 4, 5, 0, 6, 0, 0, 
+			11,11, 0, 0, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 6, 6, 
+			11,11, 0, 0, 0, 4,11,11,11, 4, 0, 0, 0, 0, 0, 0, 
+			 6,11, 0, 0, 0, 0,11,11,11, 0, 0, 0, 0, 0, 0, 0, 
+			 6, 6, 6, 0, 0, 6,11,11,11, 6, 0, 0, 0, 0, 0, 0,
+			 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0,
+			 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0,
+			 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0,
+			 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0,
+			};
+		SDL_Rect rect = {
+			.x = 0,
+			.y = 0,
+			.w = 1,
+			.h = 1,
+		};
+		for (rect.y = 0; rect.y < 16; rect.y++) {
+			for (rect.x = 0; rect.x < 16; rect.x++) {
+				SDL_FillRect(surface, &rect, 
+					palette[pat[rect.y*16+rect.x]]);
+			}
+		}
+	}
+	SDL_SetWindowIcon(window, surface);
+	SDL_FreeSurface(surface);
+}
+
 
 static SDL_Window *window = NULL;
 static SDL_Renderer *renderer = NULL;
@@ -440,6 +482,7 @@ void vdp_init(void)
 				scale_w,
 				scale_h,
 				SDL_WINDOW_RESIZABLE);
+		set_window_icon(window);
 
 		renderer = SDL_CreateRenderer(window, -1, 0);
 
@@ -585,7 +628,9 @@ int vdp_update(void)
 			case SDLK_INSERT:
 				if ((mod & KMOD_SHIFT) && kdn) {
 					char *text = SDL_GetClipboardText();
+#ifdef ENABLE_DEBUGGER
 					if (text && text[0]) paste_text(text, current_mfps);
+#endif
 					SDL_free(text);
 				} else {
 					k = TI_2 | TI_ADDFCTN;
@@ -624,10 +669,12 @@ int vdp_update(void)
 			case SDLK_HOME:
 				if (mod == 0) {
 					k = TI_HOME;
+#ifdef ENABLE_DEBUGGER
 				} else if (kdn && (mod & KMOD_CTRL)) {
 					debug_en = !debug_en;
 					if (!debug_en)
 						debug_break = DEBUG_RUN;
+#endif
 				}
 				break;
 			case SDLK_END:
@@ -635,16 +682,22 @@ int vdp_update(void)
 				break;
 
 			case SDLK_F1:
+#ifdef ENABLE_DEBUGGER
 				if (debug_en) {
 					if (kdn) debug_break = !debug_break;
-				} else {
+				} else
+#endif
+				{
 					k = TI_1+TI_ADDFCTN;
 				}
 				break;
 			case SDLK_F2:
+#ifdef ENABLE_DEBUGGER
 				if (debug_en) {
 					if (kdn) debug_break = (mod & KMOD_SHIFT) ? DEBUG_FRAME_STEP : DEBUG_SINGLE_STEP;
-				} else {
+				} else
+#endif
+				{
 					k = TI_2+TI_ADDFCTN;
 				}
 				break;
@@ -659,7 +712,12 @@ int vdp_update(void)
 
 
 			case SDLK_F11: if (kdn) SDL_SetWindowFullscreen(window, (config_fullscreen ^= SDL_WINDOW_FULLSCREEN)); break;
-			case SDLK_F12: if (!kdn) break; if (mod & KMOD_CTRL) reset(); else debug_en =! debug_en; break;
+			case SDLK_F12: if (!kdn) break;
+				if (mod & KMOD_CTRL) reset();
+#ifdef ENABLE_DEBUGGER
+				else debug_en =! debug_en;
+#endif
+				break;
 			//case SDLK_F5: if (kdn) cfg.crt_filter = (cfg.crt_filter + 1) % 3; vdp_set_filter(); break;
 			default: break;
 			}
@@ -752,12 +810,15 @@ int vdp_update(void)
 			SDL_UnlockTexture(texture);
 		}
 #endif
+#ifdef ENABLE_DEBUGGER
 		if (debug_en) {
 			SDL_Rect rect = {.x = 0, .y = 0, .w = scale_w/2, .h = scale_h/2};
 			SDL_RenderClear(renderer);
 			SDL_RenderCopy(renderer, debug_texture, NULL, NULL);
 			SDL_RenderCopy(renderer, texture, &src, &rect);
-		} else {
+		} else
+#endif
+		{
 			SDL_RenderCopy(renderer, texture, &src, NULL);
 		}
 		if (menu_active) {
