@@ -75,8 +75,10 @@ static int wait_key(void)
 			return i;
 		}
 		i = vdp_update();
+#ifdef ENABLE_DEBUGGER
 		if (menu_active == 0 && debug_en && debug_break != DEBUG_STOP)
 			return 0;
+#endif
 	} while (i != -1);
 	return -1; // Window closed
 }
@@ -948,6 +950,9 @@ int main_menu(void)
 }
 
 
+
+#ifdef ENABLE_DEBUGGER
+
 static int breakpoints_menu(int *addr, int *cur_bank)
 {
 	extern int menu_active; // sdl.c
@@ -1511,3 +1516,4 @@ debug_redraw:
 	return 0;
 }
 
+#endif // ENABLE_DEBUGGER

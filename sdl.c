@@ -372,7 +372,7 @@ static void set_window_icon(SDL_Window *window)
 			11,11, 0, 0, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 6, 6, 
 			11,11, 0, 0, 0, 4,11,11,11, 4, 0, 0, 0, 0, 0, 0, 
 			 6,11, 0, 0, 0, 0,11,11,11, 0, 0, 0, 0, 0, 0, 0, 
-			 6, 6, 6, 0, 0, 6,11,11,11, 6, 0, 0, 0, 0, 0, 0,
+			 6, 6, 6, 0, 0, 6,10,10,10, 6, 0, 0, 0, 0, 0, 0,
 			 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0,
 			 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0,
 			 0, 0, 0, 0, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0,
@@ -673,7 +673,7 @@ int vdp_update(void)
 				} else if (kdn && (mod & KMOD_CTRL)) {
 					debug_en = !debug_en;
 					if (!debug_en)
-						debug_break = DEBUG_RUN;
+						set_break(DEBUG_RUN);
 #endif
 				}
 				break;
@@ -684,7 +684,8 @@ int vdp_update(void)
 			case SDLK_F1:
 #ifdef ENABLE_DEBUGGER
 				if (debug_en) {
-					if (kdn) debug_break = !debug_break;
+					if (kdn) set_break(debug_break == DEBUG_RUN ?
+						DEBUG_STOP : DEBUG_RUN);
 				} else
 #endif
 				{
@@ -694,7 +695,10 @@ int vdp_update(void)
 			case SDLK_F2:
 #ifdef ENABLE_DEBUGGER
 				if (debug_en) {
-					if (kdn) debug_break = (mod & KMOD_SHIFT) ? DEBUG_FRAME_STEP : DEBUG_SINGLE_STEP;
+					if (kdn) set_break(
+						(mod & KMOD_CTRL) ? DEBUG_FRAME_STEP :
+						(mod & KMOD_SHIFT) ? DEBUG_SCANLINE_STEP : 
+						DEBUG_SINGLE_STEP);
 				} else
 #endif
 				{

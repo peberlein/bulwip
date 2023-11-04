@@ -107,12 +107,11 @@ static char* my_strdup(const char *p)
 
 
 static u16 tms9901_int_mask = 0; // 9901 interrupt mask
-//static u8 trace = 1; // disassembly trace flag
+
+#ifdef ENABLE_DEBUGGER
 int debug_en = 0;
 int debug_break = DEBUG_RUN;
-int config_crt_filter = 0;
-
-static void dbg_break(int en) { debug_en = 1; debug_break = en; }
+#endif
 
 static u16 fast_ram[128] = {}; // 256 bytes at 8000-80ff,repeated at 8100,8200,8300
 
@@ -642,7 +641,8 @@ static void grom_address_increment(void)
 static u16 grom_9800_r(u16 address)
 {
 	// Console GROMs will map at GROM addresses >0000-5FFF in any base
-	if ((address & 3) == 0) {
+	// Cartridge GROMs are only available in GROM base 0
+	if ((address & 3) == 0 && (ga < 0x6000 || address == 0x9800)) {
 		// grom read data
 #ifdef TRACE_GROM
 		debug_log("%04X GROM read %04X %02X\n", get_pc(), ga, grom_last);
@@ -661,7 +661,7 @@ static u16 grom_9800_r(u16 address)
 		add_cyc(25);
 		undo_push(UNDO_GL, grom_latch);
 		grom_latch = 0;
-
+		//if ((ga&0xf000) == 0x6000) printf("GDATA %04x %04x %04x %c\n", address, ga, value, value>>8);
 		return value;
 	} else if ((address & 3) == 2) {
 		// grom read address (plus one) (first low byte, then high)
@@ -672,6 +672,7 @@ static u16 grom_9800_r(u16 address)
 		grom_latch = 0;
 		ga = (ga << 8) | (ga & 0x00ff);
 		//debug_log("%04X GROM addr read %04X\n", get_pc(), ga);
+		//if ((ga&0xf000) == 0x6000) printf("GADDR %04x %04x %04x %c\n", address, ga, value, value>>8);
 		return value;
 	}
 	add_cyc(6);
@@ -1609,7 +1610,8 @@ int debug_window(void)
 
 static char *argv0_dir_name = NULL;
 
-// Load a ROM cartridge, allocating memory into dest_ptr, appending to image as necessary
+// Load a ROM cartridge, allocating memory into dest_ptr, size into size_ptr,
+// and comparing expected size in *size_ptr if nonzero
 // Returns 0 on success, -1 on error or insufficient read
 static int load_rom(char *filename, u16 **dest_ptr, unsigned int *size_ptr)
 {
@@ -1720,6 +1722,7 @@ static int load_grom(char *filename, u8 **dest_ptr, unsigned int *size_ptr)
 }
 
 
+#ifdef ENABLE_DEBUGGER
 
 /****************************************
  * Clipboard/text pasting function      *
@@ -1729,6 +1732,7 @@ static char *paste_str = NULL;
 static int paste_idx = 0;
 static int paste_old_fps = 0;
 static int paste_kscan_address = 0x0478; // 99/4A ROM only
+static int paste_delay = 0;
 
 void paste_cancel(void)
 {
@@ -1750,16 +1754,24 @@ static void paste_char(void)
 		if (c == 10) { // LF
 			if (paste_idx >= 2 && paste_str[paste_idx-2] == 13) {
 				// if prev char was CR then don't output this one
+				paste_delay = 0;
 				return;
 			}
 			c = 13; // LF to CR
 		}
+		if (paste_delay) { // this seems to fix pasting on LF-only systems
+			paste_delay = 0;
+			paste_idx--;
+			return;
+		}
+
 		if(0)printf("b=%d  %04x %04x %d %c\n", b, fast_ram[0x74>>1],
 				fast_ram[0x7c>>1],
 				c, c);
 		if (c == 0) {
 			paste_cancel();
 		} else if ((c >= 32 && c < 127) || c == 13) {
+			paste_delay = (c == 13);
 			u16 wp = get_wp();
 			if (wp >= 0x8000 && wp < 0x8400) {
 				wp &= 0xff;
@@ -1785,6 +1797,7 @@ void paste_text(char *text, int old_fps)
 	//printf("pasting %s\n", paste_str);
 	vdp_set_fps(0); // max speed
 }
+
 
 
 
@@ -1829,7 +1842,14 @@ static struct {
 static int breakpoint_count = 0;
 static int breakpoint_skip_address = -1; // for resuming after a breakpoint, or single-stepping
 
-
+void set_break(int debug_state)
+{
+	debug_break = debug_state;
+	if (debug_break != DEBUG_RUN) {
+		// clear the keyboard buffer
+		set_ui_key(0);
+	}
+}
 
 int breakpoint_read(u16 address) // called from brk_r() before read
 {
@@ -1869,7 +1889,7 @@ int breakpoint_read(u16 address) // called from brk_r() before read
 			continue; // debugger not open, but could paste instead
 
 		// breakpoint hit
-		debug_break = DEBUG_STOP;
+		set_break(DEBUG_STOP);
 
 		// skip it next time when the debugger resumes execution
 		// FIXME what if the PC is changed before resuming
@@ -1950,7 +1970,7 @@ int get_breakpoint(int address, int bank)
 	return breakpoint[i].enabled;
 }
 
-
+#endif // ENABLE_DEBUGGER
 
 
 
@@ -2015,7 +2035,7 @@ void reset(void)
 				cart_rom += 8192/2;
 				load_rom(name, &cart_rom, &cart_rom_size);
 				cart_rom -= 8192/2;
-				cart_rom_size += 16384;
+				cart_rom_size += 8192;
 				free(name);
 			}
 		}
@@ -2088,13 +2108,20 @@ int vdp_update_or_menu(void)
 		mute(1);
 		if (main_menu() == -1)
 			return -1; // quitting
+
+#ifdef ENABLE_DEBUGGER
 		if (debug_break == DEBUG_RUN)
 			mute(0);
+#else
+		mute(0);
+#endif
 		set_key(TI_MENU, 0); // unset the key so don't retrigger menu
 	}
 #endif
 	return 0;
 }
+
+#ifdef ENABLE_DEBUGGER
 
 int debug_pattern_type = 0; // 0-2=pattern tables 3=sprite table
 void update_debug_window(void)
@@ -2251,7 +2278,7 @@ static void emu_check_undo(void)
 		}
 	} while (add_cyc(0) < 0);
 }
-
+#endif // ENABLE_DEBUGGER
 
 
 
@@ -2336,9 +2363,11 @@ int main(int argc, char *argv[])
 	int lines_per_frame = 262; // NTSC=262 PAL=313
 
 	do {
+#ifdef ENABLE_DEBUGGER
 		if (debug_en) {
 			if (debug_window() == -1) break;
 		}
+#endif
 
 		// render one frame
 		do {
@@ -2361,16 +2390,22 @@ int main(int argc, char *argv[])
 			total_cycles = total_cycles_busy;
 			add_cyc(-CYCLES_PER_LINE);
 			total_cycles_busy = 0;
+#ifdef ENABLE_DEBUGGER
 			if (debug_break == DEBUG_SINGLE_STEP) {
 				single_step();
-				debug_break = DEBUG_STOP;
+				set_break(DEBUG_STOP);
 				break;
 			}
+#endif
 			emu(); // emulate until cycle counter goes positive
 			//emu_check_undo();
 			// a breakpoint will change debug_break variable
 
-		} while (vdp.y != 0 && (debug_break == DEBUG_RUN || debug_break == DEBUG_FRAME_STEP));
+		} while (vdp.y != 0
+#ifdef ENABLE_DEBUGGER
+			&& (debug_break == DEBUG_RUN || debug_break == DEBUG_FRAME_STEP)
+#endif
+			);
 #ifdef ENABLE_GIF
 		GifWriteFrame(&gif, (u8*)frame_buffer, /*width*/320, /*height*/240, /*delay*/2, /*bitDepth*/4, /*dither*/false);
 #endif

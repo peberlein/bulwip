@@ -15,7 +15,9 @@ bench: bulwip.c cpu.c sdl.c player.h cpu.h
 sdl.o: sdl.c player.h cpu.h $(CRT_H)
 sdl.o:CFLAGS += $(shell pkg-config --cflags sdl2) -DENABLE_CRT
 
-cpu.o: cpu.h
+cpu.o: cpu.c cpu.h
+bulwip.o: bulwip.c cpu.h
+ui.o: ui.c cpu.h
 
 NTSC-CRT-v2/crt_ntsc.o: NTSC-CRT-v2/crt_ntsc.c $(CRT_H)
 NTSC-CRT-v2/crt_core.o: NTSC-CRT-v2/crt_core.c $(CRT_H)

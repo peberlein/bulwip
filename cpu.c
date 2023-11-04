@@ -246,6 +246,7 @@ void map_w(u16 address, u16 value)
 	map_mem(page)[offset >> 1] = value;
 }
 
+#ifdef ENABLE_DEBUGGER
 
 // Breakpoint read
 static u16 brk_r(u16 address)
@@ -295,6 +296,7 @@ void cpu_set_breakpoint(u16 base, u16 size)
 	}
 }
 
+#endif // ENABLE_DEBUGGER
 
 
 
@@ -1042,10 +1044,12 @@ execute_op:
 		printf("%04x: %04x  %d\n", pc, op, (int)__builtin_clz(op));
 		UNHANDLED:
 		if (op == C99_BRK) {
+#ifdef ENABLE_DEBUGGER
 			if (debug_break == DEBUG_STOP) {
 				pc -= 2; // set PC to before this instruction was executed
 				goto done;
 			}
+#endif
 		}
 		unhandled(pc, op);
 		goto decode_op;
@@ -1317,13 +1321,13 @@ int debug_log(const char *fmt, ...)
 	va_end(ap);
 	return ret;
 }
-int debug_break = DEBUG_RUN;
 u8 cru_r(u16 bit) { return 1; }
 void cru_w(u16 bit, u8 value) {}
 void unhandled(u16 pc, u16 op) {}
 int get_cart_bank(void) { return 0; }
-
-
+#ifdef ENABLE_DEBUGGER
+int debug_break = DEBUG_RUN;
+#endif
 
 static u16 fast_ram[128] = {}; // 256 bytes at 8000-80ff,repeated at 8100,8200,8300
 static u16 *ram = NULL; // 32k RAM or SAMS

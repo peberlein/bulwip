@@ -1,6 +1,15 @@
 #ifndef CPU_H_
 #define CPU_H_
 
+// Configurable options to reduce binary size
+
+#define ENABLE_DEBUGGER
+#define ENABLE_UNDO
+//#define LOG_DISASM
+#define USE_SDL
+
+
+
 typedef unsigned int u32;
 typedef unsigned short u16;
 typedef signed short s16;
@@ -11,17 +20,14 @@ typedef signed char s8;
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 #endif
 
-#ifndef CPU_TEST
-#define ENABLE_UNDO
-//#define LOG_DISASM
-#endif
-
 #ifdef TEST
 // use compiled roms to avoid I/O
 #define COMPILED_ROMS
 #define ENABLE_GIF
-#else
-#define USE_SDL
+
+#undef USE_SDL
+#undef ENABLE_DEBUGGER
+#undef ENABLE_UNDO
 #endif
 
 // none of these are used yet
@@ -121,6 +127,7 @@ enum {
 	DEBUG_SCANLINE_STEP = 4,
 };
 extern int debug_break; // 0=running 1=pause 2=single step 3=frame step
+extern void set_break(int debug_state); // this also clears ui_key in ui.c
 extern int debug_log(const char *fmt, ...);
 //extern int config_crt_filter;  // 0=smooth 1=pixelated 2=crt
 
