@@ -1457,7 +1457,7 @@ static u16 mem_r(u16 address)
 static void mem_w(u16 address, u16 value)
 {
 	u8 hi = value >> 8, lo = value & 0xff;
-	printf("vdp_mem_w: %04x %04x\n", address, value);
+	//printf("vdp_mem_w: %04x %04x\n", address, value);
 	address &= ~1; // word aligned
 	if (address <= 0x47FF) { // VRAM
 		vdp.ram[address] = hi;
