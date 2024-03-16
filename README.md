@@ -49,9 +49,9 @@ While debugger is open:
 
 
 TODO
-F18A support (some bits work)
-FinalGROM99 cartridge emulation (paged 4Krom+4Kram, gram, load, dump)
-Memory view:
+- F18A support (some bits work)
+- FinalGROM99 cartridge emulation (paged 4Krom+4Kram, gram, load, dump)
+- Memory view:
   - A: set address
   - M: CPU memory
   - V: VDP memory
