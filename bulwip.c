@@ -1,7 +1,7 @@
 /*
  *  bulwip.c - TI 99/4A emulator
  *
- * Copyright (c) 2023 Pete Eberlein
+ * Copyright (c) 2024 Pete Eberlein
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -117,6 +117,15 @@ static u16 fast_ram[128] = {}; // 256 bytes at 8000-80ff,repeated at 8100,8200,8
 
 static u16 *ram = NULL; // 32k RAM or SAMS (TODO)
 static unsigned int ram_size = 0; // in bytes
+static u16 sams_bank[16] = {
+	0x000,0x000, // >0000,>1000
+	0x000,0x100, // >2000,>3000
+	0x000,0x000, // >4000,>5000
+	0x000,0x000, // >6000,>7000
+	0x000,0x000, // >8000,>9000
+	0x200,0x300, // >A000,>B000
+	0x400,0x500, // >C000,>D000
+	0x600,0x700};// >E000,>F000
 
 char *cartridge_name = NULL;
 static u16 *cart_rom = NULL;
@@ -125,6 +134,8 @@ static u8 *cart_grom = NULL;
 static unsigned int cart_grom_size = 0;
 static u16 cart_bank_mask = 0;
 static u16 cart_bank = 0; // up to 512MB cart size
+static bool cart_ram_mode = 0;
+static bool cart_gram_mode = 0;
 
 static u16 *rom = NULL;
 static unsigned int rom_size = 0;
@@ -142,21 +153,6 @@ static u8 alpha_lock = 0;
 static unsigned int total_cycles = 0;
 static volatile unsigned int total_cycles_busy = 0;
 
-#define VDP_RAM_SIZE (16*1024)
-#define VDP_ST 8
-static struct vdp {
-	u8 ram[VDP_RAM_SIZE];
-	u16 a; // address
-	u8 latch;
-	u8 reg[9]; // vdp status is [8]
-	u8 y; // scanline counter
-} vdp = {
-	.ram = {},
-	.a = 0,
-	.latch = 0,
-	.reg = {0,0,0,0,1,0,0,0,0},
-	.y = 0,
-};
 
 struct state {
 	u16 pc, wp, st;
@@ -406,8 +402,12 @@ unsigned int get_total_cpu_cycles(void)
 	// The 'busy' variable is set to the correct value during this update sequence and cleared after.
 	if (total_cycles_busy)
 		return total_cycles_busy;
+	unsigned int ret = total_cycles + add_cyc(0);
+	if (ret == 0) {
+		printf("%s: ret=%u total_cycles=%u\n", __func__, ret, total_cycles);
+	}
 	// otherwise combine 'total_cycles' and current cycle counter
-	return total_cycles + add_cyc(0);
+	return ret;
 }
 
 
@@ -472,15 +472,10 @@ static u16 vdp_8800_r(u16 address)
 	if (address == 0x8800) {
 		// 8800   VDP RAM read data register
 		undo_push(UNDO_VDPA, vdp.a);
-		return vdp.ram[vdp.a++ & 0x3fff] << 8;
+		return vdp_read_data() << 8;
 	} else if (address == 0x8802) {
 		// 8802   VDP RAM read status register
-		u16 value = vdp.reg[VDP_ST] << 8;
-		//debug_log("VDP_STATUS=%0x\n", vdp.reg[VDP_ST]);
-		undo_push(UNDO_VDPST, vdp.reg[VDP_ST]);
-		vdp.reg[VDP_ST] &= ~0xE0; // clear interrupt flags
-		interrupt(-1); // deassert INTREQ
-		return value;
+		return vdp_read_status() << 8;
 	}
 	debug_log("unhandled RAM read %04X at PC=%04X\n", address, get_pc());
 	return 0;
@@ -488,16 +483,13 @@ static u16 vdp_8800_r(u16 address)
 
 static u16 vdp_8800_safe_r(u16 address)
 {
-	//add_cyc(6);
-	vdp.latch = 0;
 	if (address == 0x8800) {
 		// 8800   VDP RAM read data register
-		return vdp.ram[vdp.a & 0x3fff] << 8;
+		return vdp_read_data_safe() << 8;
 	} else if (address == 0x8802) {
 		// 8802   VDP RAM read status register
-		return vdp.reg[VDP_ST] << 8;
+		return vdp_read_status_safe() << 8;
 	}
-	debug_log("unhandled RAM read %04X at PC=%04X\n", address, get_pc());
 	return 0;
 }
 
@@ -536,38 +528,13 @@ static void vdp_8c00_w(u16 address, u16 value)
 		undo_push(UNDO_VDPA, vdp.a);
 		undo_push(UNDO_VDPL, vdp.latch);
 		undo_push(UNDO_VDPRAM, (vdp.a << 8) | vdp.ram[vdp.a]);
-		vdp.ram[vdp.a] = value >> 8;
-		vdp.a = (vdp.a + 1) & 0x3fff; // wraps at 16K
-		vdp.latch = 0;
+		vdp_write_data(value >> 8);
 		return;
 	} else if (address == 0x8C02) {
 		// 8C02   VDP RAM write address register
 		undo_push(UNDO_VDPA, vdp.a);
 		undo_push(UNDO_VDPL, vdp.latch);
-		vdp.latch ^= 1;
-		if (vdp.latch) {
-			// first low byte 
-			vdp.a = value >> 8;
-		} else {
-			// second high byte
-			if (value & 0x8000) {
-				// register write
-				undo_push(UNDO_VDPR, (value & 0x700) | vdp.reg[(value >> 8) & 7]);
-				vdp.reg[(value >> 8) & 7] = vdp.a & 0xff;
-#ifdef TRACE_VDP
-				fprintf(stdout, "VDP register %X %02X at PC=%04X\n", (value >> 8) & 7, vdp.a & 0xff, get_pc());
-#endif
-			} else if (value & 0x4000) {
-				// set address for data write
-				vdp.a |= (value & 0x3f00);
-				//debug_log("VDP address for write %04X\n", vdp.a);
-			} else {
-				// set address for data read
-				vdp.a |= (value & 0x3f00);
-				// FIXME: this should start reading the data and increment the address
-				//debug_log("VDP address for read %04X at PC=%04X\n", vdp.a, get_pc());
-			}
-		}
+		vdp_write_addr(value >> 8);
 		return;
 	}
 }
@@ -634,7 +601,7 @@ static u8 grom_read(void)
 
 static void grom_address_increment(void)
 {
-	// increment and wrap around
+	// increment and wrap around, stay in the same GROM "bank"
 	ga = (ga & 0xe000) | ((ga+1) & 0x1fff);
 }
 
@@ -781,17 +748,35 @@ static void dsr_rom_w(u16 address, u16 value)
 
 static void set_cart_bank(u16 bank)
 {
-	// 8K banking
-	cart_bank = bank & cart_bank_mask;
-	u16 *base = cart_rom + cart_bank * 4096/*words per 8KB bank*/;
-	//printf("%s: address=%04X bank=%d\n", __func__, bank, cart_bank);
-	change_mapping(0x6000, 0x2000, base);
+	static int once = 1;
+
+	if (cart_ram_mode) {
+		// 4K banking  >6xxx ROM  >7xxx RAM
+		// writes to >60xx change ROM bank
+		// writes to >68xx change RAM bank
+
+		u16 offset = (bank & 0x400) << 2; // 0=ROM 4096=RAM
+		cart_bank = bank & cart_bank_mask;
+		u16 *base = cart_rom + cart_bank * 4096/*words per 8KB bank*/;
+
+		change_mapping(0x6000 + offset, 0x1000, base + offset);
+	} else {
+		// 8K banking
+		if (bank > cart_bank_mask && once) {
+			once = 0;
+			printf("Warning: bank %x > %x mask pc=%04x r11=%04x\n", bank, cart_bank_mask, get_pc(), safe_r(get_wp()+22));
+		}
+		cart_bank = bank & cart_bank_mask;
+		u16 *base = cart_rom + cart_bank * 4096/*words per 8KB bank*/;
+		//printf("%s: address=%04X bank=%d\n", __func__, bank, cart_bank);
+		change_mapping(0x6000, 0x2000, base);
+	}
 }
 
 static void cart_rom_w(u16 address, u16 value)
 {
 	undo_push(UNDO_CB, cart_bank);
-	set_cart_bank(address >> 1);
+	set_cart_bank((address >> 1) & 0xfff);
 	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	//debug_log("Cartridge ROM write %04X %04X\n", address, value);
 }
@@ -824,6 +809,118 @@ static void zero_w(u16 address, u16 value)
 	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
 	return;
 }
+
+
+// SAMS expansion, be sure to read
+// https://www.unige.ch/medecine/nouspikel/ti99/superams.htm
+
+// SAMS mapper registers, page# in MSB
+// >4004  >2000-2FFF
+// >4006  >3000-3FFF
+// >4014  >A000-AFFF
+// >4016  >B000-BFFF
+// >4018  >C000-CFFF
+// >401A  >D000-DFFF
+// >401C  >E000-EFFF
+// >401E  >F000-FFFF
+
+#define SAMS_PAGE_SIZE 4096
+#if 1
+// 1MB SAMS mapping
+#define SAMS_PAGE(n) (sams_bank[n]>>8)
+#else
+// 16MB SAMS mapping (FIXME - doesn't work with AMSTEST-4)
+#define SAMS_PAGE(n) ((sams_bank[n]>>8)|((sams_bank[n]&0xf)<<8))
+#endif
+
+
+static int sams_transparent = 1;
+static void sams_map(int n)
+{
+	unsigned int word_offset = SAMS_PAGE(n) * SAMS_PAGE_SIZE / 2;
+	printf("%s: n=%x page=%d trans=%d\n", __func__, n, SAMS_PAGE(n), sams_transparent);
+	change_mapping(n * SAMS_PAGE_SIZE, SAMS_PAGE_SIZE, ram + word_offset);
+}
+
+static void sams_mode(int mapping)
+{
+	printf("%s: mode=%d\n", __func__, mapping);
+	sams_transparent = !mapping;
+	if (mapping) {
+		// mapping based on registers
+		sams_map(0x2); sams_map(0x3); // >4004, >4006
+		sams_map(0xa); sams_map(0xb); // >4014, >4016
+		sams_map(0xc); sams_map(0xd); // >4018, >401A
+		sams_map(0xe); sams_map(0xf); // >401C, >401E
+	} else {
+		// transparent mode: page 2 @ >2000, page 3 @ >3000, etc.
+		change_mapping(0x2000, 0x2000, ram + 0x2000/2);
+		change_mapping(0xa000, 0x6000, ram + 0xa000/2);
+	}
+}
+
+// SAMS powers up with transparent mode enabled - to allow 
+// 32K compatibility without mapping registers being initialized.
+// however the emulator starts with 32K mapping 0@>2000 and >2000@>A000
+// and SAMS transparent mode is >2000@>2000 and >A000@>A000
+
+static void sams_init(void)
+{
+	if (get_pc() < 0x2000) return;
+	printf("Initializing SAMS, PC=%04X\n", get_pc());
+
+	// increase to 64K so that transparent mode can work
+	ram_size = 0x10000;
+	ram = my_realloc(ram, ram_size);
+
+	// move the 32K data to keep the same layout in 64K
+	memmove(ram+0xa000/2, ram+0x2000/2, 0x6000);
+	memmove(ram+0x2000/2, ram+0x0000/2, 0x2000);
+	// clear the rest: >0000->1fff, >4000->9ffff
+	memset(ram+0x0000/2, 0, 0x2000);
+	memset(ram+0x4000/2, 0, 0x6000);
+	sams_mode(!sams_transparent); // update mappings
+}
+
+static void sams_4000_w(u16 address, u16 value)
+{
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
+	address &= ~1;
+	if (address >= 0x4000 && address <= 0x401e) {
+		int n = (address - 0x4000) / 2;
+		sams_bank[n] = value;
+		printf("sams reg[%x] = %04x\n", n, value);
+
+		// don't map pages in >0000->1FFF,>4000->9FFF
+		if ((1 << n) & 0x3f3) return;
+		if (sams_transparent) return;
+
+		unsigned int page = SAMS_PAGE(n);
+		unsigned int page_end = (page+1) * SAMS_PAGE_SIZE;
+
+		if (page_end > ram_size) {
+			ram_size = page_end;
+			ram = my_realloc(ram, ram_size);
+			//printf("RAM increased to %d bytes %p\n", ram_size, ram);
+			sams_mode(1); // reload register mappings
+		}
+
+		//printf("SAMS map >%04X, page >%02X\n", n * SAMS_PAGE_SIZE, page);
+		sams_map(n);
+	}
+}
+
+static u16 sams_4000_r(u16 address)
+{
+	add_cyc(6); // 2 cycles for memory access + 4 for multiplexer
+	address &= ~1;
+	if (address >= 0x4000 && address <= 0x401e) {
+		int n = (address - 0x4000) / 2;
+		return sams_bank[n];
+	}
+	return 0;
+}
+
 
 
 /****************************************
@@ -1062,9 +1159,24 @@ void cru_w(u16 bit, u8 value)
 	default:
 		//fprintf(stderr, "%s %d not implemented at pc=%x\n", value ? "SBO" : "SBZ", bit, get_pc());
 		break;
-	case 0x1e00 >> 1: break;  // SAMS mapper access
-	case 0x1e02 >> 1: break;  // SAMS mpping mode
-	case 0x1e04 >> 1: break;  // SAMS 4MB mode?
+
+	case 0x1e00 >> 1:  // SAMS mapper access value: 0=enable 1=disable
+		value ^= 1;
+		printf("SAMS access %s\n", value ? "disabled" : "enabled");
+		set_mapping(0x4000, 0x1000,
+			value ? zero_r : sams_4000_r,
+			value ? zero_w : sams_4000_w,
+			NULL);
+		break;
+	case 0x1e02 >> 1:  // SAMS mapping mode 1=mapping 0=transparent
+		printf("SAMS mode %s\n", value ? "mapping" : "transparent");
+		if (value && ram_size < 0x10000)
+			sams_init();
+		sams_mode(value);
+		break;
+	case 0x1e04 >> 1:  // SAMS 4MB mode?
+		printf("SAMS 4MB? %d\n", value);
+		break;
 	}
 }
 
@@ -1087,431 +1199,6 @@ void unhandled(u16 pc, u16 op)
 }
 
 
-/****************************************
- * VDP scanline rendering               *
-****************************************/
-
-
-// clamp number between 0.0 and 1.0
-#define CLAMP(x) ((x) < 0 ? 0 : (x) > 1 ? 1 : (x))
-// take values from 0.0 to 1.0
-#if 1
-// YUV to RGB for analog TV
-#define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.000*Y               +1.140*(Cb-0.5))*255)<<16) | \
-                          ((int)(CLAMP(1.000*Y-0.395*(Cr-0.5)-0.581*(Cb-0.5))*255)<<8)  | \
-			  ((int)(CLAMP(1.000*Y+2.032*(Cr-0.5)               )*255)))	| \
-			  0xff000000
-#elif 0
-// YCbCr to RGB for SDTV
-#define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.164*Y               +1.596*(Cb-0.5))*255)<<16) | \
-                          ((int)(CLAMP(1.164*Y-0.392*(Cr-0.5)-0.813*(Cb-0.5))*255)<<8)  | \
-			  ((int)(CLAMP(1.164*Y+2.017*(Cr-0.5)               )*255)))	| \
-			  0xff000000
-#elif 0
-// Full-range YCbCr to RGB for SDTV
-#define YUV2RGB(Y,Cb,Cr) (((int)(CLAMP(1.000*Y               +1.400*(Cb-0.5))*255)<<16) | \
-                          ((int)(CLAMP(1.000*Y-0.343*(Cr-0.5)-0.711*(Cb-0.5))*255)<<8)  | \
-			  ((int)(CLAMP(1.000*Y+1.765*(Cr-0.5)               )*255)))	| \
-			  0xff000000
-#endif
-
-unsigned int palette[16] = {
-#if 0
-// http://atariage.com/forums/topic/238672-rgb-color-codes-for-ti-994a-colors/
-	0x000000, // transparent
-	0x000000, // black
-	0x46b83c, // medium green
-	0x7ccf70, // light green
-	0x5d4fff, // dark blue
-	0x7f71ff, // light blue
-	0xb66247, // dark red
-	0x5cc7ee, // cyan
-	0xd86b48, // medium red
-	0xfb8f6c, // light red
-	0xc3ce42, // dark yellow
-	0xd3db77, // light yellow
-	0x3ea030, // dark green
-	0xb664c6, // magenta
-	0xcdcdcd, // gray
-	0xffffff, // white
-#elif 0
-// TMS https://www.smspower.org/maxim/forumstuff/colours.html
-	0x000000, // transparent
-	0x000000, // black
-	0x47b73b, // medium green
-	0x7ccf6f, // light green
-	0x5d4eff, // dark blue
-	0x8072ff, // light blue
-	0xb66247, // dark red
-	0x5dc8ed, // cyan
-	0xd76b48, // medium red
-	0xfb8f6c, // light red
-	0xc3cd41, // dark yellow
-	0xd3da76, // light yellow
-	0x3e9f2f, // dark green
-	0xb664c7, // magenta
-	0xcccccc, // gray
-	0xffffff, // white
-#elif 0
-// SMS https://www.smspower.org/forums/post37531#37531
-	0x000000, // transparent
-	0x000000, // black
-	0x00aa00, // medium green
-	0x00ff00, // light green
-	0x000055, // dark blue
-	0x0000ff, // light blue
-	0x550000, // dark red
-	0x00ffff, // cyan
-	0xaa0000, // medium red
-	0xff0000, // light red
-	0x555500, // dark yellow
-	0xffff00, // light yellow
-	0x005500, // dark green
-	0xff00ff, // magenta
-	0x555555, // gray
-	0xffffff, // white
-#else
-// http://www.unige.ch/medecine/nouspikel/ti99/tms9918a.htm#Colors
-// taken from TMS9918A/TMS9928A/TMS9929A Video Display Processors TABLE 2-3
-	0x000000, // transparent
-	YUV2RGB(0.00, 0.47, 0.47), // black
-	YUV2RGB(0.53, 0.07, 0.20), // medium green
-	YUV2RGB(0.67, 0.17, 0.27), // light green
-	YUV2RGB(0.40, 0.40, 1.00), // dark blue
-	YUV2RGB(0.53, 0.43, 0.93), // light blue
-	YUV2RGB(0.47, 0.83, 0.30), // dark red
-	YUV2RGB(0.67, 0.00, 0.70), // cyan   NOTE! 992X use Luma .73
-	YUV2RGB(0.53, 0.93, 0.27), // medium red
-	YUV2RGB(0.67, 0.93, 0.27), // light red
-	YUV2RGB(0.73, 0.57, 0.07), // dark yellow
-	YUV2RGB(0.80, 0.57, 0.17), // light yellow
-	YUV2RGB(0.47, 0.13, 0.23), // dark green
-	YUV2RGB(0.53, 0.73, 0.67), // magenta
-	YUV2RGB(0.80, 0.47, 0.47), // gray
-	YUV2RGB(1.00, 0.47, 0.47), // white
-#endif
-};
-
-
-
-#define TOPBORD 24
-#define BOTBORD 24
-#define LFTBORD 32
-#define RGTBORD 32
-#define SPRITES_PER_LINE 4
-#define EARLY_CLOCK_BIT 0x80
-#define FIFTH_SPRITE 0x40
-#define SPRITE_COINC 0x20
-
-static int config_sprites_per_line = SPRITES_PER_LINE;
-
-enum {
-	MODE_1_STANDARD = 0,
-	MODE_2_BITMAP = 2,
-	MODE_8_MULTICOLOR = 8,
-	MODE_10_TEXT = 0x10,
-	MODE_12_TEXT_BITMAP = 0x12,
-	MODE_SPRITES = 0x20,
-};
-
-static void draw_char_patterns(
-	uint32_t *pixels,
-	unsigned int sy,
-	unsigned char *scr,
-	unsigned char mode,
-	unsigned char *reg,
-	unsigned char *ram,
-	int bord,
-	int len)
-{
-	uint32_t bg = palette[reg[7] & 0xf];
-	uint32_t fg = palette[(reg[7] >> 4) & 0xf];
-	unsigned char *col = ram + reg[3] * 0x40;
-	unsigned char *pat = ram + (reg[4] & 0x7) * 0x800 + (sy & 7);
-
-	if (mode == MODE_1_STANDARD) {
-		// mode 1 (standard)
-		scr += (sy / 8) * 32;
-
-		for (unsigned char i = 32; i; i--) {
-			unsigned char
-				ch = *scr++,
-				c = col[ch >> 3];
-			unsigned int
-				fg = palette[c >> 4],
-				bg = palette[c & 15];
-			ch = pat[ch * 8];
-			for (unsigned char j = 0x80; j; j >>= 1)
-				*pixels++ = ch & j ? fg : bg;
-		}
-	} else if (mode & MODE_10_TEXT) {
-		unsigned char i = len == 640 ? 80 : 40;
-		// text mode(s)
-		scr += (sy / 8) * i;
-		for (int i = 0; i < bord/4; i++) {
-			*pixels++ = bg;
-		}
-		if (mode == MODE_10_TEXT) {
-			for (; i; i--) {
-				unsigned char ch = *scr++;
-				ch = pat[ch * 8];
-				for (unsigned char j = 0x80; j != 2; j >>= 1)
-					*pixels++ = ch & j ? fg : bg;
-			}
-		} else if (mode == MODE_12_TEXT_BITMAP) { // text bitmap
-			unsigned int patmask = ((reg[4]&3)<<11)|(0x7ff);
-			pat = ram + (reg[4] & 0x04) * 0x800 +
-				(((sy / 64) * 2048) & patmask) + (sy & 7);
-			for (; i; i--) {
-				unsigned char ch = *scr++;
-				ch = pat[ch * 8];
-				for (unsigned char j = 0x80; j != 2; j >>= 1)
-					*pixels++ = ch & j ? fg : bg;
-			}
-		} else { // illegal mode (40 col, 4px fg, 2px bg)
-			for (; i; i--) {
-				*pixels++ = fg;
-				*pixels++ = fg;
-				*pixels++ = fg;
-				*pixels++ = fg;
-				*pixels++ = bg;
-				*pixels++ = bg;
-			}
-		}
-		for (int i = 0; i < bord/4; i++) {
-			*pixels++ = bg;
-		}
-
-	} else if (mode == MODE_2_BITMAP) {
-		// mode 2 (bitmap)
-
-		// masks for hybrid modes
-		unsigned int colmask = ((reg[3] & 0x7f) << 6) | 0x3f;
-		unsigned int patmask = ((reg[4] & 3) << 11) | (colmask & 0x7ff);
-
-		scr += (sy / 8) * 32;  // get row
-
-		col = ram + (reg[3] & 0x80) * 0x40 +
-			(((sy / 64) * 2048) & colmask) + (sy & 7);
-		pat = ram + (reg[4] & 0x04) * 0x800 +
-			(((sy / 64) * 2048) & patmask) + (sy & 7);
-
-		// TODO handle bitmap modes
-		for (unsigned char i = 32; i; i--) {
-			unsigned char
-				ch = *scr++,
-				c = col[(ch & patmask) * 8];
-			uint32_t
-				fg = palette[c >> 4],
-				bg = palette[c & 15];
-			ch = pat[(ch & colmask) * 8];
-			for (unsigned char j = 0x80; j; j >>= 1)
-				*pixels++ = ch & j ? fg : bg;
-		}
-	} else if (mode == MODE_8_MULTICOLOR) {
-		// multicolor 64x48 pixels
-		pat -= (sy & 7); // adjust y offset
-		pat += ((sy / 4) & 7);
-
-		scr += (sy / 8) * 32;  // get row
-
-		for (unsigned char i = 32; i; i--) {
-			unsigned char
-				ch = *scr++,
-				c = pat[ch * 8];
-			uint32_t
-				fg = palette[c >> 4],
-				bg = palette[c & 15];
-			for (unsigned char j = 0; j < 4; j++)
-				*pixels++ = fg;
-			for (unsigned char j = 0; j < 4; j++)
-				*pixels++ = bg;
-		}
-
-	} else if (mode == MODE_SPRITES) {
-		// sprite patterns - debug only 
-		unsigned char *sp = ram + (reg[6] & 0x7) * 0x800 // sprite pattern table
-			+ (sy & 7);
-		scr += (sy / 8) * 32;
-		fg = palette[15];
-		bg = palette[1];
-
-		for (unsigned char i = 32; i; i--) {
-			unsigned char ch = *scr++;
-			ch = sp[ch * 8];
-			for (unsigned char j = 0x80; j; j >>= 1)
-				*pixels++ = ch & j ? fg : bg;
-		}
-
-
-	}
-}
-
-
-void vdp_line(unsigned int line,
-		unsigned char* restrict reg,
-		unsigned char* restrict ram)
-{
-	uint32_t *pixels;
-	int len = 320;
-	int bord = LFTBORD;
-	uint32_t bg = palette[reg[7] & 0xf];
-	uint32_t fg = palette[(reg[7] >> 4) & 0xf];
-
-	palette[0] = palette[(reg[7] & 0xf) ?: 1];
-
-	if ((reg[0] & 6) == 4 && (reg[1] & 0x18) == 0x10) {
-		// 80-col text mode
-		len *= 2;
-		bord *= 2;
-	}
-
-	vdp_lock_texture(line, len, (void**)&pixels);
-
-	if (line < TOPBORD || line >= TOPBORD+192 || (reg[1] & 0x40) == 0) {
-		// draw border or blanking
-		for (int i = 0; i < len; i++) {
-			*pixels++ = bg;
-		}
-	} else {
-		unsigned int sy = line - TOPBORD; // screen y, adjusted for border
-		unsigned char *scr = ram + (reg[2] & 0xf) * 0x400;
-		unsigned char mode = (reg[0] & 0x02) | (reg[1] & 0x18);
-
-		// draw left border
-		for (int i = 0; i < bord; i++) {
-			*pixels++ = bg;
-		}
-
-		uint32_t *save_pixels = pixels;
-
-		// draw graphics
-		draw_char_patterns(pixels, sy, scr, mode, reg, ram, bord, len);
-		pixels += len - 2 * bord;
-
-		// draw right border
-		for (int i = 0; i < bord; i++) {
-			*pixels++ = bg;
-		}
-		pixels = save_pixels;
-
-		// no sprites in text mode
-		if (!(reg[1] & 0x10)) {
-			unsigned char sp_size = (reg[1] & 2) ? 16 : 8;
-			unsigned char sp_mag = sp_size << (reg[1] & 1); // magnified sprite size
-			unsigned char *sl = ram + (reg[5] & 0x7f) * 0x80; // sprite list
-			unsigned char *sp = ram + (reg[6] & 0x7) * 0x800; // sprite pattern table
-			unsigned char coinc[256] = {0};
-
-			// draw sprites  (TODO limit 4 sprites per line, and higher priority sprites)
-			struct {
-				unsigned char *p;  // Sprite pattern data
-				unsigned char x;   // X-coordinate
-				unsigned char f;   // Color and early clock bit
-			} sprites[32]; // TODO Sprite limit hardcoded at 4
-			int sprite_count = 0;
-
-			for (unsigned char i = 0; i < 32; i++) {
-				unsigned int dy = sy;
-				unsigned char y = *sl++; // Y-coordinate minus 1
-				unsigned char x = *sl++; // X-coordinate
-				unsigned char s = *sl++; // Sprite pattern index
-				unsigned char f = *sl++; // Flags and color
-
-				if (y == 0xD0) // Sprite List terminator
-					break;
-				if (y > 0xD0)
-					dy += 256; // wraps around top of screen
-				if (y+1+sp_mag <= dy || y+1 > dy)
-					continue; // not visible
-				if (sp_size == 16)
-					s &= 0xfc; // mask sprite index
-
-				//if (f & 15)
-				//	printf("%d %x %d %d %d %02x %02x\n", sy, (reg[5]&0x7f)*0x80, sprite_count, y, x, s, f);
-				if (sprite_count == SPRITES_PER_LINE && (reg[8] & FIFTH_SPRITE) == 0) {
-					reg[8] &= 0xe0;
-					reg[8] |= FIFTH_SPRITE + i;
-				}
-				if (sprite_count >= config_sprites_per_line)
-					break;
-
-				sprites[sprite_count].p = sp + (s * 8) + ((dy - (y+1)) >> (reg[1]&1));
-				sprites[sprite_count].x = x;
-				sprites[sprite_count].f = f;
-				sprite_count++;
-			}
-			// draw in reverse order so that lower sprite index are higher priority
-			while (sprite_count > 0) {
-				sprite_count--;
-				unsigned char *p = sprites[sprite_count].p; // pattern pointer
-				int x = sprites[sprite_count].x;
-				unsigned char f = sprites[sprite_count].f; // flags and color
-				unsigned int c = palette[f & 0xf];
-				unsigned int mask = (p[0] << 8) | p[16]; // bit mask of solid pixels
-				int count = sp_mag; // number of pixels to draw
-				int inc_mask = (reg[1] & 1) ? 1 : 0xff;
-
-
-				//printf("%d %d %d %04x\n", sprite_count, x, f, mask);
-				if (f & EARLY_CLOCK_BIT) {
-					x -= 32;
-					while (count > 0 && x < 0) {
-						if (count & inc_mask)
-							mask <<= 1;
-						++x;
-						count--;
-					}
-				}
-
-				while (count > 0) {
-					if (mask & 0x8000) {
-						if (f != 0)  // don't draw transparent color
-							pixels[x] = c;
-						reg[8] |= coinc[x];
-						coinc[x] = SPRITE_COINC;
-					}
-					if (count & inc_mask)
-						mask <<= 1;
-					if (++x >= 256)
-						break;
-					count--;
-				}
-			}
-		}
-	}
-	vdp_unlock_texture();
-}
-
-void redraw_vdp(void)
-{
-	int y;
-	for (y = 0; y < 240; y++) {
-		vdp_line(y, vdp.reg, vdp.ram);
-	}
-}
-
-static void print_name_table(u8* reg, u8 *ram)
-{
-	static const char hex[] = "0123456789ABCDEF";
-	unsigned char *line = ram + (reg[2]&0xf)*0x400;
-	int offset = (reg[2]&0xf) == 0 && (reg[4]&0x7) == 0 ?
-			0x60 : 0; // use 0 for no offset, 0x60 for XB
-	int y, x, w = (reg[1] & 0x10) ? 40 : 32;
-	for (y = 0; y < 24; y++) {
-		for (x = 0; x < w; x++) {
-			unsigned char c = *line++ - offset;
-			printf("%c%c",
-				c >= ' ' && c < 127 ? ' ' : hex[(c+offset)>>4],
-				c >= ' ' && c < 127 ? c   : hex[(c+offset)&15]);
-		}
-		printf("\n");
-	}
-	//printf("Regs: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-	//	reg[0],reg[1],reg[2],reg[3],reg[4],reg[5],reg[6],reg[7]);
-	// TI BASIC 00 e0 f0 0c f8 86 f8 07
-	// XB       00 e0 00 20 00 06 00 07
-}
 
 
 #ifndef USE_SDL
@@ -1558,7 +1245,6 @@ int vdp_update(void)
 	} else if (countdown) {
 		countdown--;
 	} else if (test_argc > 0) {
-		
 
 	}
 
@@ -1577,7 +1263,7 @@ int vdp_update(void)
 #define unused __attribute__((unused))
 
 
-void vdp_text_pat(unused unsigned char *pat)
+void vdp_text_pat(unused u8 *pat)
 {
 }
 
@@ -1653,6 +1339,7 @@ static int load_rom(char *filename, u16 **dest_ptr, unsigned int *size_ptr)
 
 	if (!dest || size > buf_size) {
 		buf_size = (size + 0x1fff) & ~0x1fff; // round up to nearest 8k
+		printf("size=%d buf_size=%d\n", size, buf_size);
 		dest = my_realloc(dest, buf_size);
 		*dest_ptr = dest;
 		if (size_ptr) *size_ptr = buf_size;
@@ -1992,12 +1679,15 @@ void reset(void)
 {
 	cpu_reset();
 
-	// reset VDP regs
-	vdp.reg[0] = 0;
-	vdp.reg[1] = 0;
-	vdp.latch = 0;
-	vdp.a = 0;
-	vdp.y = 0;
+	{
+		static int once = 1;
+		if (once) {
+			once = 0;
+			// reset VDP regs only the first time
+			vdp_reset();
+		}
+	}
+
 
 	printf("initial PC=%04X WP=%04X ST=%04X\n", get_pc(), get_wp(), get_st());
 	//debug_log("initial WP=%04X PC=%04X ST=%04X\n", get_wp(), get_pc(), get_st());
@@ -2028,14 +1718,20 @@ void reset(void)
 			// loaded success, try D rom
 			if (tolower(cartridge_name[len-5]) == 'c' && cart_rom_size == 8192) {
 				char *name = malloc(len + 1);
+				u16 *rom2 = NULL;
+				unsigned int rom2_size = 0;
+
+				// copy name and increment last letter in filename
 				memcpy(name, cartridge_name, len + 1);
-				// if '*c.bin' TODO check for '*d.bin'
 				name[len-5]++; // C to D
-				cart_rom = realloc(cart_rom, 16384);
-				cart_rom += 8192/2;
-				load_rom(name, &cart_rom, &cart_rom_size);
-				cart_rom -= 8192/2;
-				cart_rom_size += 8192;
+
+				// attempt loading D rom
+				if (load_rom(name, &rom2, &rom2_size) == 0) {
+					cart_rom_size = 16384;
+					cart_rom = realloc(cart_rom, cart_rom_size);
+					memcpy(cart_rom + 8192/2, rom2, rom2_size < 8192 ? rom2_size : 8192);
+					free(rom2);
+				}
 				free(name);
 			}
 		}
@@ -2045,18 +1741,23 @@ void reset(void)
 
 			// get next power of 2
 			cart_bank_mask = banks>1 ? (1 << (32-__builtin_clz(banks-1))) - 1 : 0;
-#if 0
-			cart_bank_mask = banks-1;
-			cart_bank_mask |= cart_bank_mask >> 1;
-			cart_bank_mask |= cart_bank_mask >> 2;
-			cart_bank_mask |= cart_bank_mask >> 4;
-			cart_bank_mask |= cart_bank_mask >> 8;
-			cart_bank_mask |= cart_bank_mask >> 16;
-#endif
 
-			printf("cart_bank_mask = 0x%x (size=%d banks=%d) page_size=%d\n",
-				cart_bank_mask, cart_rom_size, banks, 256/*1<<MAP_SHIFT*/);
-			set_cart_bank(0);
+			printf("cart_bank_mask = 0x%x (size=%d banks=%d) page_size=%d mode=%c\n",
+				cart_bank_mask, cart_rom_size, banks, 256/*1<<MAP_SHIFT*/,
+				cart_rom[3] ?: ' ');
+			cart_ram_mode = cart_rom[3] == 'R' || cart_rom[3] == 'X';
+			cart_gram_mode = cart_rom[3] == 'G' || cart_rom[3] == 'X';
+
+			if (cart_ram_mode) {
+				set_mapping(0x6000, 0x1000, map_r, cart_rom_w, NULL);
+				set_mapping(0x7000, 0x1000, map_r, map_w, NULL);
+				set_cart_bank(0); // init ROM bank
+				set_cart_bank(0x400);  // init RAM bank
+			} else {
+				// cartridge ROM 6000-7fff
+				set_mapping(0x6000, 0x2000, map_r, cart_rom_w, NULL);
+				set_cart_bank(0);
+			}
 		}
 
 		// optionally load GROM
@@ -2208,10 +1909,14 @@ void update_debug_window(void)
 
 	// draw char patterns 
 	{
-		unsigned char scr[32*24], save_r4 = vdp.reg[4];
-		void *pixels;
-		unsigned char mode = (vdp.reg[0] & 0x02) | (vdp.reg[1] & 0x18);
-		unsigned char sp_size = 0;
+		u8 scr[32*24];
+#ifdef ENABLE_F18A
+		u8 save_r27 = vdp.reg[27], save_r28 = vdp.reg[28];
+		vdp.reg[27] = 0; vdp.reg[28] = 0; // clear pixel scroll regs
+#endif
+		u32 *pixels;
+		u8 mode = (vdp.reg[0] & 0x02) | (vdp.reg[1] & 0x18);
+		u8 sp_size = 0;
 		int i, y_offset = debug_pattern_type * 64;
 
 		if (debug_pattern_type == 3) {
@@ -2226,16 +1931,38 @@ void update_debug_window(void)
 		}
 
 		for (i = 0; i < 8*8; i++) {
-			vdp_lock_debug_texture(i+16*8, 640, &pixels);
-			draw_char_patterns(((uint32_t*)pixels) + 320+32,
+			vdp_lock_debug_texture(i+16*8, 640, (void**)&pixels);
+			draw_char_patterns(pixels + 320+32,
 				i+y_offset, scr, mode, vdp.reg, vdp.ram, 32, 320);
 			vdp_unlock_debug_texture();
 		}
 		vdp_text_window(&"1\n2\n3\nS\n"[debug_pattern_type*2], 1,1, 322+3*6,16*8, -1);
+#ifdef ENABLE_F18A
+		vdp.reg[27] = save_r27;
+		vdp.reg[28] = save_r28;
+#endif
 	}
+	{	// draw palette
+		int i,j;
+		for (j = 0; j < 16; j++) {
+			u32 *pixels;
+			vdp_lock_debug_texture(j+25*8, 640, (void**)&pixels);
+			for (i = 0; i < 32*8; i++) {
+#ifdef ENABLE_F18A
+				if (!vdp.locked)
+					pixels[320+32+i] = pal_rgb((j&8)*4 + i/8);
+				else
+#endif
+				pixels[320+32+i] = pal_rgb(i/16);
+				//vdp_text_clear(320+32+(i&31)*8, 16*8+8*8+8+(i&32)/4, 2,1, pal_rgb(i));
+			}
+			vdp_unlock_debug_texture();
+		}
+	}
+
 }
 
-
+#ifdef ENABLE_UNDO
 static void emu_check_undo(void)
 {
 	struct state s0, s1, s2;
@@ -2278,6 +2005,7 @@ static void emu_check_undo(void)
 		}
 	} while (add_cyc(0) < 0);
 }
+#endif
 #endif // ENABLE_DEBUGGER
 
 
@@ -2371,6 +2099,10 @@ int main(int argc, char *argv[])
 
 		// render one frame
 		do {
+#ifdef ENABLE_F18A
+			gpu();
+#endif
+
 			// render one scanline
 			if (vdp.y < 240) {
 				undo_push(UNDO_VDPST, vdp.reg[VDP_ST]);

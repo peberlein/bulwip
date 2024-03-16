@@ -1,12 +1,12 @@
 #CC=clang
-CFLAGS+=-O3
+CFLAGS+=-O3 -g
 
 #CRT=NTSC-CRT-v2/crt_ntsc.o NTSC-CRT-v2/crt_core.o
 #CRT_H=NTSC-CRT-v2/crt_core.h NTSC-CRT-v2/crt_ntsc.h
 CRT=NTSC-CRT/crt.o
 CRT_H=NTSC-CRT/crt.h
 
-bulwip: bulwip.o cpu.o ui.o sdl.o $(CRT)
+bulwip: bulwip.o cpu.o ui.o sdl.o gpu.c $(CRT)
 bulwip:LDLIBS += $(shell pkg-config --libs sdl2)
 
 bench: bulwip.c cpu.c sdl.c player.h cpu.h
@@ -18,6 +18,7 @@ sdl.o:CFLAGS += $(shell pkg-config --cflags sdl2) -DENABLE_CRT
 cpu.o: cpu.c cpu.h
 bulwip.o: bulwip.c cpu.h
 ui.o: ui.c cpu.h
+gpu.o: gpu.c cpu.h
 
 NTSC-CRT-v2/crt_ntsc.o: NTSC-CRT-v2/crt_ntsc.c $(CRT_H)
 NTSC-CRT-v2/crt_core.o: NTSC-CRT-v2/crt_core.c $(CRT_H)

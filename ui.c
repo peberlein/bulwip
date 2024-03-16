@@ -56,6 +56,9 @@ struct config_struct cfg = {
 #define BLACK  0xff000000
 #define GREEN  0xff009f00
 #define RED    0xffbf0000
+#define WHITE  0xfff0f0f0
+#define WHITE_GREEN  0xff80cf00
+#define WHITE_RED    0xffdf8000
 
 static int ui_key = 0;
 
@@ -503,16 +506,22 @@ static void draw_listing(struct list_segment *seg, unsigned int *offset, int *li
 	}
 	vdp_text_window(bp, 30,1, 322,240-8, i);
 #else
+	// draw a square to the left of the lines, indicating PC, breakpoints, etc
 	unsigned int i = 0, a = *offset;
+	int cart_bank = get_cart_bank();
 	for (i = 0; i < h; i++) {
 		int pc = get_line_pc(seg->src, a);
+		int bank = get_line_bank(seg->src, a);
 		int bp = -1;
 		if (pc != -1) {
-			int bank = get_line_bank(seg->src, a);
 			bp = get_breakpoint(pc, bank);
 			//printf("line=%d offset=%u a=%u pc=%x bank=%d\n", *line, *offset, a, pc, bank);
 		}
 		vdp_text_clear(640-(w+1)*6, 240+i*8, 1,1,
+				debug_break == DEBUG_RUN ? BLACK :
+				pc == get_pc() && (bank == -1 || bank == cart_bank) ? (
+					bp == -1 ? WHITE :
+					bp == 0 ? WHITE_GREEN : WHITE_RED) :
 				bp == -1 ? BLACK :
 				bp == 0 ? GREEN : RED);
 
@@ -926,7 +935,7 @@ int main_menu(void)
 
 	vdp_text_clear(0, 0, 320/6,240/8, CLEAR);
 	while (ret == 0) {
-		vdp_text_clear(MENU_X+8, MENU_Y+8, w,h, 0x80000000); // shadow
+		vdp_text_clear(MENU_X+8, MENU_Y+8, w,h, SHADOW);
 		vdp_text_window(menu, w,h, MENU_X,MENU_Y, sel);
 
 		switch (wait_key()) {
@@ -996,7 +1005,7 @@ refresh:
 	while (ret == 0) {
 		int len = strlen(menu);
 		int k;
-		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, 0x80000000); // shadow
+		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, SHADOW);
 		vdp_text_window(menu, w,h, MENU_X,MENU_Y, i);
 		//vdp_text_window(menu, w-2,1, MENU_X+6,MENU_Y+8, -1);
 		k = wait_key();
@@ -1079,7 +1088,7 @@ static int text_entry(char *title, char **stack)
 	while (ret == 0) {
 		int len = strlen(text);
 		int k;
-		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, 0x80000000); // shadow
+		vdp_text_clear(MENU_X+8,MENU_Y+8, w,h, SHADOW);
 		vdp_text_window(menu, w,h, MENU_X,MENU_Y, -1);
 		vdp_text_window(text, w-2,1, MENU_X+6,MENU_Y+8, -1);
 		k = wait_key();
@@ -1396,7 +1405,7 @@ debug_redraw:
 			return 0; // return to draw one whole frame, then come back here
 		}
 		// single stepping or paused will redraw whole frame
-		redraw_vdp();
+		vdp_redraw();
 
 		if (debug_break == DEBUG_SINGLE_STEP) {
 			extern int trace; // cpu.c
@@ -1466,8 +1475,14 @@ debug_redraw:
 				if (do_find(seg->src, &offset, &line))
 					goto debug_redraw;
 				break;
+			
+			//case TI_G: // goto address
+			//	if (do_goto(&offset, &line))
+			//		goto debug_redraw;
+			//	break;
 
-			case TI_B:
+
+			case TI_B: // set/enable disable breakpoint
 			case TI_DELETE: {
 				unsigned int off = step_lines(seg->src, seg->src_len, offset, line);
 				int pc, ba;

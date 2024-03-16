@@ -45,5 +45,18 @@ While debugger is open:
 - Shift-Z: Reverse instruction step until PC goes lower (good for rewinding out of a loop)
 - 1/2/3/S: Show character pattern tables, or sprite pattern table
 - TODO Ctrl->B: Go to referenced label
+- SAMS banking 1MB
 
+
+TODO
+F18A support (some bits work)
+FinalGROM99 cartridge emulation (paged 4Krom+4Kram, gram, load, dump)
+Memory view:
+  - A: set address
+  - M: CPU memory
+  - V: VDP memory
+  - G: GROM
+  - S: SAMS
+
+Android? (https://github.com/cnlohr/rawdrawandroid)
 

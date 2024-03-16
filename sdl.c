@@ -71,28 +71,42 @@ static void my_audio_callback(void *userdata, Uint8 *stream, int len)
 
 	if (time_since_update > audio_max_delay || muted) {
 		// render loop is paused or window being moved/resized
-		memset(stream, 128, len); // silence
+		memset(stream, 128, len); // silence AUDIO_U8
 	} else {
 		static unsigned int rclk = 0; // regen cpu clock but don't overshoot it!
 
 		#define CLKS 32
 		static unsigned int cpu_clks[CLKS] = {0};
+		static unsigned int rel = 0;
 		unsigned int
 			cpu = get_total_cpu_cycles(),
-			//samples = CLKS * len,
 			clocks = cpu - cpu_clks[0];
+		int i, sum = 0;
+		for (i = 1; i < CLKS; i++) {
+			sum += cpu_clks[i] - cpu_clks[i-1];
+		}
 
-		rclk += clocks / CLKS;
+		rclk += rel;
+
 		if ((int)(rclk - cpu) > 0) {
 			// overshot available data
 			//printf("overshoot %d\n", (rclk - cpu));
 			rclk = cpu;
 		} else {
 			// adjust closer to prevent drifting too far behind
-			rclk += (int)(cpu - rclk) / 64;  // 63/64 rclk + 1/64 cpu
+			//rclk += (int)(cpu - rclk) / 64;  // 63/64 rclk + 1/64 cpu
+			rel = (rel*(128-CLKS) + (cpu - rclk)) >> 7;
 		}
-		//printf("cpu clks %d / samples %d, N=%d  rel=%d\n", clocks, samples, 
-		//	clocks / CLKS, rclk - last);
+		//if (clocks < 400000 || clocks > 1000000) {
+		//	printf("clocks=%d %u-%u\n", clocks, cpu, cpu_clks[0]);
+		//}
+		if (0) {
+			static unsigned int last = 0;
+			printf("cpu clks %u / samples %u, N=%u %u rel=%d  cpu=%u\n", clocks, CLKS,
+				clocks / CLKS, sum/(CLKS-1),
+				 (int)(rclk - last), cpu);
+			last = rclk;
+		}
 
 		memmove(cpu_clks, cpu_clks+1, sizeof(cpu_clks)-sizeof(cpu_clks[0]));
 		cpu_clks[CLKS-1] = cpu;
@@ -448,7 +462,7 @@ void vdp_set_filter(void)
 	texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
 			SDL_TEXTUREACCESS_STREAMING, texture_width, texture_height);
 
-	redraw_vdp(); // redraw the screen texture
+	vdp_redraw(); // redraw the screen texture
 }
 
 void vdp_init(void)
@@ -610,7 +624,7 @@ int vdp_update(void)
 			case SDLK_t:      k = TI_T+alphalock; break;
 			case SDLK_b:      k = TI_B+alphalock; break;
 
-			case SDLK_SLASH:  k = TI_SLASH; break;
+			case SDLK_SLASH:  k = (mod & KMOD_SHIFT ? TI_I | TI_ADDFCTN : TI_SLASH); break;
 			case SDLK_SEMICOLON: k = TI_SEMICOLON; break;
 			case SDLK_p:      k = TI_P+alphalock; break;
 			case SDLK_0:      k = TI_0; break;
@@ -638,7 +652,7 @@ int vdp_update(void)
 					k = TI_2 | TI_ADDFCTN;
 				}
 				break;
-			case SDLK_BACKQUOTE: k = TI_C | TI_ADDFCTN; break;
+			case SDLK_BACKQUOTE: k = (mod & KMOD_SHIFT ? TI_W : TI_C) | TI_ADDFCTN; break;
 			case SDLK_LEFTBRACKET: k = (mod & KMOD_SHIFT ? TI_G : TI_R) | TI_ADDFCTN; break;
 			case SDLK_RIGHTBRACKET: k = (mod & KMOD_SHIFT ? TI_F : TI_T) | TI_ADDFCTN; break;
 			case SDLK_BACKSLASH: k = (mod & KMOD_SHIFT ? TI_A : TI_Z) | TI_ADDFCTN; break;
@@ -740,10 +754,11 @@ int vdp_update(void)
 				}
 				if (k == TI_SHIFT) {
 					// modifier key changed, clear any modifiable keys
-					set_key(kdn ? TI_R : TI_G, 0);
-					set_key(kdn ? TI_T : TI_F, 0);
-					set_key(kdn ? TI_Z : TI_A, 0);
-					set_key(kdn ? TI_O : TI_P, 0);
+					set_key(kdn ? TI_I : TI_SLASH, 0); // ? /
+					set_key(kdn ? TI_R : TI_F, 0); // [ {
+					set_key(kdn ? TI_T : TI_G, 0); // ] } 
+					set_key(kdn ? TI_Z : TI_A, 0); // \ |
+					set_key(kdn ? TI_O : TI_P, 0); // ' "
 				}
 				if (!kdn) set_key(k & 0x3f, 0); // on keyup, set meta after
 				if (k & TI_ADDSHIFT) {
