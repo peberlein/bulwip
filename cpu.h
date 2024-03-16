@@ -4,7 +4,7 @@
 // Configurable options to reduce binary size
 
 #define ENABLE_DEBUGGER
-#define ENABLE_UNDO
+//#define ENABLE_UNDO
 //#define LOG_DISASM
 #define USE_SDL
 
@@ -19,6 +19,10 @@ typedef signed char s8;
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 #endif
+#ifndef BIT
+#define BIT(x)  (1UL<<(x))
+#endif
+
 
 #ifdef TEST
 // use compiled roms to avoid I/O
@@ -130,6 +134,7 @@ extern int debug_break; // 0=running 1=pause 2=single step 3=frame step
 extern void set_break(int debug_state); // this also clears ui_key in ui.c
 extern int debug_log(const char *fmt, ...);
 //extern int config_crt_filter;  // 0=smooth 1=pixelated 2=crt
+extern void unhandled(u16 pc, u16 op);
 
 extern int breakpoint_read(u16 address); // called from brk_r()
 extern int breakpoint_write(u16 address); // called from brk_w()
@@ -295,4 +300,77 @@ enum {
 	C99_DBG  = 0x0120,    // debug printf +register number
 };
 
+// gpu.c
+#define ENABLE_F18A
+
+#ifdef ENABLE_F18A
+#define VDP_RAM_SIZE (18*1024)
+#define VDP_ST 64
+extern struct vdp {
+	u8 ram[VDP_RAM_SIZE];
+	u16 a; // address
+	u8 latch;
+	u8 reg[VDP_ST+16]; // normal regs + status regs
+	u8 y;
+	u8 pal[128]; // 64 palette words 0000rrrr_ggggbbbb
+	u8 locked; // 0=unlocked 1=locked 2=half-unlocked
+} vdp;
+
+#else
+
+#define VDP_RAM_SIZE (16*1024)
+#define VDP_ST 8
+extern struct vdp {
+	u8 ram[VDP_RAM_SIZE];
+	u16 a; // address
+	u8 latch;
+	u8 reg[VDP_ST+1]; // vdp status is [8]
+	u8 y; // scanline counter
+} vdp;
 #endif
+
+enum {
+	MODE_1_STANDARD = 0,
+	MODE_2_BITMAP = 2,
+	MODE_8_MULTICOLOR = 8,
+	MODE_10_TEXT = 0x10,
+	MODE_12_TEXT_BITMAP = 0x12,
+	MODE_SPRITES = 0x20,
+};
+
+extern void vdp_write_data(u8 value);
+extern void vdp_write_addr(u8 value);
+extern u8 vdp_read_data(void);
+extern u8 vdp_read_status(void);
+extern u8 vdp_read_data_safe(void);
+extern u8 vdp_read_status_safe(void);
+
+extern void vdp_reset(void);
+extern void vdp_redraw(void);
+
+extern u32 pal_rgb(int idx);
+extern void vdp_line(unsigned int line,
+		u8* restrict reg,
+		u8* restrict ram);
+
+extern void draw_char_patterns(
+	u32 *pixels,
+	unsigned int sy,    // screen y: 0..191
+	u8 *scr,
+	u8 mode,
+	u8 *reg,
+	u8 *ram,
+	int bord,
+	int len  // 640 for 80-col, 320 for 32/40-col
+		// horizontal pixel offset
+		// vertical pixel offset
+		// reg29 - tile pattern generator offset size, scroll size
+		// reg24 - tile palette select in normal and ecm1
+	);
+
+#ifdef ENABLE_F18A
+extern void gpu(void); // execute on the GPU
+#endif
+
+
+#endif // CPU_H_

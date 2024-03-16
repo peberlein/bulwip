@@ -80,12 +80,22 @@ void single_step(void)
 
 
 
-
+// forward
+static u16 brk_r(u16 address);
+static void brk_w(u16 address, u16 value);
 
 /******************************************
  * Memory page mapping functions          *
  ******************************************/
 
+// Function pointers for accessing memory in PAGE-sized chunks.
+// Functions suitable for each memory mapped device may be 
+// efficiently selected in this way.
+// A breakpoint will replace the accessor function for only
+// the page the breakpoint is in, leaving other pages unaffected.
+// Note: The "safe read" function variant is required to not have 
+// side-effects, i.e. no auto-incrementing read address or clearing flags,
+// making it suitable for examining memory in debugger for instance.
 
 // Use 12 for 4K pages, or 10 for 1K pages (0x400) or 8 for 256B pages
 //#define MAP_SHIFT 12
@@ -143,10 +153,12 @@ void set_mapping_safe(int base, int size,
 	end = (base + size) >> MAP_SHIFT;
 	base >>= MAP_SHIFT;
 	for (i = base; i < end; i++) {
-		map_read(i) = read;
+		if (map_read(i) != brk_r)
+			map_read(i) = read;
 		map_read_orig(i) = read;
 		map_safe_read(i) = safe_read;
-		map_write(i) = write;
+		if (map_write(i) != brk_w)
+			map_write(i) = write;
 		map_write_orig(i) = write;
 		map_mem(i) = mem ? mem + ((i-base) << (MAP_SHIFT-1)) : NULL;
 		//printf("map page=%x address=%p\n", base+i, map[base+i].mem);
@@ -275,7 +287,7 @@ static void brk_w(u16 address, u16 value)
 	}
 }
 
-
+// Reset any breakpoint mappings to the original mappings
 void cpu_reset_breakpoints(void)
 {
 	int i;
@@ -399,8 +411,6 @@ static always_inline u16 swpb(u16 x)
 	return (x << 8) | (x >> 8);
 }
 
-extern void unhandled(u16 pc, u16 op);
-
 static always_inline u16 add(u16 a, u16 b)
 {
 	u16 res;
@@ -429,7 +439,9 @@ static always_inline u16 sub(u16 a, u16 b)
 
 static always_inline int shift_count(u16 op, u16 wp)
 {
-	return (op >> 4) & 15 ?: reg_r(wp, 0) & 15 ?: 16;
+	int count = (op >> 4) & 15 ?: reg_r(wp, 0) & 15 ?: 16;
+	cyc += 2 * count;
+	return count;
 }
 
 
@@ -438,17 +450,19 @@ static always_inline int shift_count(u16 op, u16 wp)
  * Ts source and Td destination operand decoding *
  *************************************************/
 
-// source returned as value (indirects are followed)
-static always_inline u16 Ts(u16 op, u16 *pc, u16 wp)
+// bytes=2 source returned as word value (indirects are followed)
+// bytes=1 source returned as byte value (in high byte, low byte is zero)
+static always_inline u16 Ts(u16 op, u16 *pc, u16 wp, u8 bytes)
 {
 	u16 val, addr = 0;
 	u16 reg = op & 15;
+
 	switch ((op >> 4) & 3) {
 	case 0: // Rx
-		val = reg_r(wp, reg);
-		break;
+		return bytes == 2 ? reg_r(wp, reg) : reg_r(wp, reg) & 0xff00;
 	case 1: // *Rx
-		val = mem_r(reg_r(wp, reg));
+		addr = reg_r(wp, reg);
+		val = mem_r(addr);
 		cyc += 2;
 		break;
 	case 2: // @yyyy(Rx) or @yyyy if Rx=0
@@ -460,59 +474,28 @@ static always_inline u16 Ts(u16 op, u16 *pc, u16 wp)
 		break;
 	case 3: // *Rx+
 		addr = reg_r(wp, reg);
+		reg_w(wp, reg, addr + bytes); // NOTE: increment before fetch!
 		val = mem_r(addr);   // read value, then update
-		reg_w(wp, reg, addr + 2);
-		cyc += 4;
+		cyc += bytes * 2; // word=4 byte=2
 		break;
 	}
-	return val;
-}
-
-// source returned as byte value (in high byte, low byte is zero)
-// (indirects are followed)
-static always_inline u16 TsB(u16 op, u16 *pc, u16 wp)
-{
-	u16 val, addr = 0;
-	u16 reg = op & 15;
-
-	switch ((op >> 4) & 3) {
-	case 0: // Rx   2c
-		return reg_r(wp, reg) & 0xff00;
-	case 1: // *Rx  6c
-		addr = reg_r(wp, reg);
-		val = mem_r(addr);
-		cyc += 2;
-		break;
-	case 2: // @yyyy(Rx) or @yyyy if Rx=0  10c
-		if (reg) addr = reg_r(wp, reg); else cyc += 2;
-		addr += mem_r(*pc);
-		*pc += 2;
-		val = mem_r(addr);
-		cyc += 4;
-		break;
-	case 3: // *Rx+   10c
-		addr = reg_r(wp, reg);
-		val = mem_r(addr);
-		reg_w(wp, reg, addr + 1);
-		cyc += 2;
-		break;
-	}
-	return (addr & 1) ? val << 8 : val & 0xff00;
+	return bytes == 2 ? val :
+		(addr & 1) ? val << 8 : val & 0xff00;
 }
 
 struct val_addr {
 	u16 val, addr;
 };
 
-static always_inline struct val_addr Td(u16 op, u16 *pc, u16 wp)
+static always_inline struct val_addr Td(u16 op, u16 *pc, u16 wp, u16 bytes)
 {
 	struct val_addr va;
 	u16 reg = op & 15;
 
 	switch ((op >> 4) & 3) {
 	case 0: // Rx  2c
-		va.val = reg_r(wp, reg);
 		va.addr = wp + 2 * reg;
+		va.val = reg_r(wp, reg);
 		break;
 	case 1: // *Rx  6c
 		va.addr = reg_r(wp, reg);
@@ -529,65 +512,27 @@ static always_inline struct val_addr Td(u16 op, u16 *pc, u16 wp)
 		break;
 	case 3: // *Rx+   10c
 		va.addr = reg_r(wp, reg);
+		reg_w(wp, reg, va.addr + bytes); // NOTE: increment before fetch!
 		va.val = mem_r(va.addr);
-		//reg_w(wp, reg, va.addr + 2); // Post-increment must be done later
-		cyc += 4;
+		cyc += bytes * 2; // word=4 byte=2
 		break;
 	}
 	return va;
 }
 
-static always_inline struct val_addr TdB(u16 op, u16 *pc, u16 wp)
-{
-	struct val_addr va;
-	u16 reg = op & 15;
 
-	switch ((op >> 4) & 3) {
-	case 0: // Rx
-		va.val = reg_r(wp, reg);
-		va.addr = wp + 2 * reg;
-		break;
-	case 1: // *Rx
-		va.addr = reg_r(wp, reg);
-		va.val = mem_r(va.addr);
-		cyc += 2;
-		break;
-	case 2: // @yyyy(Rx) or @yyyy if Rx=0
-		va.addr = 0;
-		if (reg) va.addr = reg_r(wp, reg); else cyc += 2;
-		va.addr += mem_r(*pc);
-		*pc += 2;
-		va.val = mem_r(va.addr);
-		cyc += 4;
-		break;
-	case 3: // *Rx+
-		va.addr = reg_r(wp, reg);
-		va.val = mem_r(va.addr);
-		//reg_w(wp, reg, va.addr + 1); // Post-increment must be done later
-		cyc += 2;
-		break;
-	}
-	return va;
+static always_inline void byte_op(u16 *op, u16 *pc, u16 wp, u16 *ts, struct val_addr *td)
+{
+	*ts = Ts(*op, pc, wp, 1);
+	*op >>= 6;
+	*td = Td(*op, pc, wp, 1);
 }
 
-static always_inline void Td_post_increment(u16 op, u16 wp, struct val_addr va, int bytes)
+static always_inline void word_op(u16 *op, u16 *pc, u16 wp, u16 *ts, struct val_addr *td)
 {
-	if (((op >> 4) & 3) == 3) {
-		// post increment
-		reg_w(wp, op & 15, va.addr + bytes);
-	}
-}
-
-static always_inline void mem_w_Td(u16 op, u16 wp, struct val_addr va)
-{
-	mem_w(va.addr, va.val);
-	Td_post_increment(op, wp, va, 2);
-}
-
-static always_inline void mem_w_TdB(u16 op, u16 wp, struct val_addr va)
-{
-	mem_w(va.addr, va.val);
-	Td_post_increment(op, wp, va, 1);
+	*ts = Ts(*op, pc, wp, 2);
+	*op >>= 6;
+	*td = Td(*op, pc, wp, 2);
 }
 
 
@@ -662,11 +607,16 @@ static const struct {
 // writing to memory WP to WP+31 resets the cache entry
 
 
+// This maps instruction opcodes from 16 bits to 7 bits, making switch lookup table more efficient
+#define DECODE(x) ((((x) >> (24-__builtin_clz(x))) & 0x78) | (22-__builtin_clz(x)))
+
 // instruction opcode decoding using count-leading-zeroes (clz)
 
 void emu(void)
 {
 	u16 op, pc = gPC, wp = gWP;
+	u16 ts;
+	struct val_addr td;
 #ifdef LOG_DISASM
 	int start_cyc;
 #endif
@@ -710,338 +660,292 @@ start_decoding_skip_undo:
 	pc += 2;
 execute_op:
 	cyc += 6; // base cycles
-	if (op < 0x0200) goto UNHANDLED;
 
-	// Try to emit a BSR instruction without the XOR 31
-	switch ((__builtin_clz(op << 16)^31)&7) {
-	case 7-0: case 7-1: {  // opcodes 0x4000 .. 0xffff
-		u16 ts, reg;
-		struct val_addr td;
-		if (op & 0x1000) { // byte op
-			ts = TsB(op, &pc, wp);
-			op >>= 6;
-			td = TdB(op, &pc, wp);
-			switch ((op >> 7) & 7) {
-			case 0: goto UNHANDLED;
-			case 1: goto UNHANDLED;
-			case 2: SZCB:
-				if (td.addr & 1) {
-					td.val &= ~(ts >> 8);
-					status_parity(status_zero(td.val << 8));
-				} else {
-					td.val &= ~ts;
-					status_parity(status_zero(td.val & 0xff00));
-				}
-				mem_w_TdB(op, wp, td);
-				goto decode_op;
-			case 3: SB:
-				if (td.addr & 1) {
-					td.val = (td.val & 0xff00) | status_parity(sub(td.val << 8, ts) >> 8);
-				} else {
-					td.val = (td.val & 0x00ff) | status_parity(sub(td.val & 0xff00, ts));
-				}
-				mem_w_TdB(op, wp, td);
-				goto decode_op;
-			case 4: CB:
-				if (td.addr & 1) {
-					status_arith(status_parity(ts), td.val << 8);
-				} else {
-					status_arith(status_parity(ts), td.val & 0xff00);
-				}
-				cyc += 2;
-				Td_post_increment(op, wp, td, 1);
-				goto decode_op;
-			case 5: AB:
-				if (td.addr & 1) {
-					td.val = (td.val & 0xff00) | status_parity(add(td.val << 8, ts) >> 8);
-				} else {
-					td.val = (td.val & 0x00ff) | status_parity(add(td.val & 0xff00, ts));
-				}
-				mem_w_TdB(op, wp, td);
-				goto decode_op;
-			case 6: MOVB:
-				if (td.addr & 1) {
-					td.val = (td.val & 0xff00) | status_parity(status_zero(ts) >> 8);
-				} else {
-					td.val = (td.val & 0x00ff) | status_parity(status_zero(ts));
-				}
-				mem_w_TdB(op, wp, td);
-				goto decode_op;
-			case 7: SOCB:
-				if (td.addr & 1) {
-					td.val |= (ts >> 8);
-					status_parity(status_zero(td.val << 8));
-				} else {
-					td.val |= ts;
-					status_parity(status_zero(td.val & 0xff00));
-				}
-				mem_w_TdB(op, wp, td);
-				goto decode_op;
-			}
-		} else { // word op
-			ts = Ts(op, &pc, wp);
-			op >>= 6;
-			td = Td(op, &pc, wp);
-			switch ((op >> 7) & 7) {
-			case 0: goto UNHANDLED;
-			case 1: goto UNHANDLED;
-			case 2: SZC: td.val = status_zero(td.val & ~ts); mem_w_Td(op, wp, td); goto decode_op;
-			case 3: S: td.val = sub(td.val, ts); mem_w_Td(op, wp, td); goto decode_op;
-			case 4: C: status_arith(ts, td.val); cyc+=2; Td_post_increment(op, wp, td, 2); goto decode_op;
-			case 5: A: td.val = add(td.val, ts); mem_w_Td(op, wp, td); goto decode_op;
-			case 6: MOV: td.val = status_zero(ts); mem_w_Td(op, wp, td); goto decode_op;
-			case 7: SOC: td.val = status_zero(td.val | ts); mem_w_Td(op, wp, td); goto decode_op;
-			}
-		}
-		__builtin_unreachable();
-		}
-	case 7-2:   // opcodes 0x2000 .. 0x3fff
-		switch ((op >> 10) & 7) {
-		case 0: COC: {
-			u16 ts = Ts(op, &pc, wp);
-			u16 td = reg_r(wp, (op >> 6) & 15);
-			if ((ts & td) == ts) set_EQ(); else clr_EQ();
-			cyc += 2;
-			goto decode_op;
-			}
-		case 1: CZC: {
-			u16 ts = Ts(op, &pc, wp);
-			u16 td = reg_r(wp, (op >> 6) & 15);
-			if (!(ts & td)) set_EQ(); else clr_EQ();
-			cyc += 2;
-			goto decode_op;
-			}
-		case 2: XOR: {
-			u8 reg = (op >> 6) & 15;
-			u16 ts = Ts(op, &pc, wp);
-			u16 td = reg_r(wp, reg);
-			reg_w(wp, reg, status_zero(ts ^ td));
-			goto decode_op;
-			}
-		case 3: XOP: {
-			struct val_addr td = Td(op, &pc, wp); // source
-			u8 reg = (op >> 6) & 15; // XOP number usually 1 or 2
-			u16 ts = mem_r(0x0040 + (reg << 2)); // new WP
+	switch (DECODE(op)) {
+	LI:   case DECODE(0x0200): reg_w(wp, op&15, status_zero(mem_r(pc))); pc += 2; goto decode_op;
+	AI:   case DECODE(0x0220): reg_w(wp, op&15, add(reg_r(wp, op&15), mem_r(pc))); pc += 2; goto decode_op;
+	ANDI: case DECODE(0x0240): reg_w(wp, op&15, status_zero(reg_r(wp, op&15) & mem_r(pc))); pc += 2; goto decode_op;
+	ORI:  case DECODE(0x0260): reg_w(wp, op&15, status_zero(reg_r(wp, op&15) | mem_r(pc))); pc += 2; goto decode_op;
+	CI:   case DECODE(0x0280): status_arith(reg_r(wp, op&15), mem_r(pc)); cyc += 2; pc += 2; goto decode_op;
+	STWP: case DECODE(0x02A0): reg_w(wp, op&15, wp); goto decode_op;
+	STST: case DECODE(0x02C0): reg_w(wp, op&15, get_st()); goto decode_op;
+	LWPI: case DECODE(0x02E0): cyc -= 2; undo_push(UNDO_WP, wp); wp = mem_r(pc); cyc += 2; pc += 2; goto decode_op;
+	LIMI: case DECODE(0x0300): cyc -= 2; undo_push(UNDO_WP, wp); set_IM(mem_r(pc) & 15); pc += 2; gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
 
-			undo_push(UNDO_WP, wp);
-			mem_w(ts + 2*11, td.addr); // gAS copied to R11
-			Td_post_increment(op, wp, td, 2);
-			mem_w(ts + 2*13, wp); // WP to R13
-			mem_w(ts + 2*14, pc); // PC to R14
-			mem_w(ts + 2*15, get_st()); // ST to R15
-			pc = mem_r(0x0042 + (reg << 2));
-			wp = ts;
-			set_X();
-			//printf("XOP %04x %d  PC=%04x WP=%04x\n", td.val, reg, pc, wp);
-
-			goto decode_op_now; // next instruction cannot be interrupted
-			}
-		case 4: LDCR: {
-			u8 idx, c = ((op >> 6) & 15) ?: 16;
-			u16 ts, reg = (reg_r(wp, 12) & 0x1ffe) >> 1;
-			if (c <= 8) {
-				ts = TsB(op, &pc, wp) >> 8;
-				status_parity(ts);
-			} else {
-				ts = Ts(op, &pc, wp);
-			}
-			//printf("LDCR c=%d reg=%d ts=%x\n", c, reg, ts);
-			for (idx = 0; idx < c; idx++)
-				cru_w(reg + idx, (1 << idx) & ts ? 1 : 0);
-			status_zero(ts);
-			goto decode_op;
-			}
-		case 5: STCR: {
-			struct val_addr td;
-			u8 idx, c = ((op >> 6) & 15) ?: 16;
-			u16 reg = (reg_r(wp, 12) & 0x1ffe) >> 1;
-			if (c <= 8) {
-				td = TdB(op, &pc, wp);
-				td.val &= (td.addr & 1) ? 0xff00 : 0x00ff;
-				u16 base = (td.addr & 1) ? 1 : 0x100;
-				for (idx = 0; idx < c; idx++) {
-					if (cru_r(reg + idx))
-						td.val |= (base << idx);
-				}
-				mem_w_TdB(op, wp, td);
-				//if (reg == 3 /*&& (va.val&0xff00) != 0xff00*/) {
-				//	printf("STCR %d reg=%d val=%04x pc=%x kb=%d R4=%04x\n", c, reg, va.val, pc, keyboard_row,
-				//			fast_ram[(wp-0x8300)/2+4]);
-				//	
-				//}
-				status_parity(status_zero(td.val & 0xff00));
-			} else {
-				td = Td(op, &pc, wp);
-				td.val = 0;
-				for (idx = 0; idx < c; idx++) {
-					if (cru_r(reg + idx))
-						td.val |= (1 << idx);
-				}
-				//printf("STCR %d reg=%d val=%04x pc=%x\n", c, reg, va.val, pc);
-				mem_w_Td(op, wp, td);
-				status_zero(td.val);
-			}
-			//printf("STCR reg=%d %x %d  %x\n", reg, va.addr, c, va.val);
-			// TODO status bits
-			goto decode_op;
-			}
-		case 6: MPY: {
-			u32 val = Ts(op, &pc, wp);
-			u8 reg = (op >> 6) & 15;
-			//debug_log("MPY %04X x %04X = %08X\n", 
-			//	val, reg_r(wp, reg), val * reg_r(wp, reg));
-			val *= reg_r(wp, reg);
-			reg_w(wp, reg, val >> 16);
-			reg_w(wp, reg+1, val & 0xffff);
-			goto decode_op;
-			}
-		case 7: DIV: {
-			u32 val;
-			u16 ts = Ts(op, &pc, wp);
-			u8 reg = (op >> 6) & 15;
-			val = reg_r(wp, reg);
-			if (ts <= val) {
+	IDLE: case DECODE(0x0340): debug_log("IDLE not implemented\n");/* TODO */ goto decode_op;
+	RSET: case DECODE(0x0360): debug_log("RSET not implemented\n"); /* TODO */ goto decode_op;
+	RTWP: case DECODE(0x0380): undo_push(UNDO_WP, wp); set_st(reg_r(wp, 15)); pc = reg_r(wp, 14); wp = reg_r(wp, 13); gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
+	CKON: case DECODE(0x03A0): debug_log("CKON not implemented\n");/* TODO */ goto decode_op;
+	CKOF: case DECODE(0x03C0): debug_log("CKOF not implemented\n");/* TODO */ goto decode_op;
+	LREX: case DECODE(0x03E0): debug_log("LREX not implemented\n");/* TODO */ goto decode_op;
+	BLWP: case DECODE(0x0400):
+		cyc += 8;
+		undo_push(UNDO_WP, wp);
+		td = Td(op, &pc, wp, 2);
+		//debug_log("OLD pc=%04X wp=%04X st=%04X  NEW pc=%04X wp=%04X\n", pc, wp, st, safe_r(va.addr+2), va.val);
+		mem_w(td.val + 2*13, wp);
+		mem_w(td.val + 2*14, pc);
+		mem_w(td.val + 2*15, get_st());
+		pc = mem_r(td.addr + 2);
+		wp = td.val;
+		goto decode_op_now; // next instruction cannot be interrupted
+	B:    case DECODE(0x0440): cyc -= 2; td = Td(op, &pc, wp, 2); pc = td.addr; goto decode_op;
+	X:    case DECODE(0x0480): cyc -= 2; td = Td(op, &pc, wp, 2); op = td.val; /*printf("X op=%x pc=%x\n", op, pc);*/ goto execute_op;
+	CLR:  case DECODE(0x04C0): cyc -= 2; td = Td(op, &pc, wp, 2); td.val = 0; mem_w(td.addr, td.val); goto decode_op;
+	NEG:  case DECODE(0x0500): cyc -= 2; td = Td(op, &pc, wp, 2); td.val = sub(0, td.val); mem_w(td.addr, td.val); goto decode_op;
+	INV:  case DECODE(0x0540): cyc -= 2; td = Td(op, &pc, wp, 2); td.val = status_zero(~td.val); mem_w(td.addr, td.val); goto decode_op;
+	INC:  case DECODE(0x0580): cyc -= 2; td = Td(op, &pc, wp, 2); td.val = add(td.val,1); mem_w(td.addr, td.val); goto decode_op;
+	INCT: case DECODE(0x05C0): cyc -= 2; td = Td(op, &pc, wp, 2); td.val = add(td.val,2); mem_w(td.addr, td.val); goto decode_op;
+	DEC:  case DECODE(0x0600): cyc -= 2; td = Td(op, &pc, wp, 2); td.val = sub(td.val,1); mem_w(td.addr, td.val); goto decode_op;
+	DECT: case DECODE(0x0640): cyc -= 2; td = Td(op, &pc, wp, 2); td.val = sub(td.val,2); mem_w(td.addr, td.val); goto decode_op;
+	BL:   case DECODE(0x0680): cyc -= 2; td = Td(op, &pc, wp, 2); reg_w(wp, 11, pc); pc = td.addr; goto decode_op;
+	SWPB: case DECODE(0x06C0): cyc -= 2; td = Td(op, &pc, wp, 2); td.val = swpb(td.val); mem_w(td.addr, td.val); goto decode_op;
+	SETO: case DECODE(0x0700): cyc -= 2; td = Td(op, &pc, wp, 2); td.val = 0xffff; mem_w(td.addr, td.val); goto decode_op;
+	ABS:  case DECODE(0x0740):
+		td = Td(op, &pc, wp, 2);
+		status_zero(td.val); // status compared to zero before operation
+		clr_OV();
+		clr_C(); // carry is not listed affected in manual, but it is
+		//printf("%04x\n", td.val);
+		if (td.val & 0x8000) { // negative? (sign bit set)
+			if (td.val == 0x8000)
 				set_OV();
-			} else {
-				clr_OV();
-				val = (val << 16) | reg_r(wp, reg+1);
-				//debug_log("DIV %08X by %04X\n", val, ts);
-				reg_w(wp, reg, val / ts);
-				reg_w(wp, reg+1, val % ts);
-			}
-			goto decode_op;
-			}
+			else
+				td.val = -td.val;
+			cyc += 2;
 		}
-		__builtin_unreachable();
-	case 7-3: // opcodes 0x1000 .. 0x1fff
-		switch ((op >> 8) & 15) {
-		case 0: JMP: cyc += 2; pc += 2 * (s8)(op & 0xff); goto decode_op;
-		case 1: JLT: if (tst_LT()) goto JMP; goto decode_op;
-		case 2: JLE: if (tst_LE()) goto JMP; goto decode_op;
-		case 3: JEQ: if (tst_EQ()) goto JMP; goto decode_op;
-		case 4: JHE: if (tst_HE()) goto JMP; goto decode_op;
-		case 5: JGT: if (tst_GT()) goto JMP; goto decode_op;
-		case 6: JNE: if (!tst_EQ()) goto JMP; goto decode_op;
-		case 7: JNC: if (!tst_C()) goto JMP; goto decode_op;
-		case 8: JOC: if (tst_C()) goto JMP; goto decode_op;
-		case 9: JNO: if (!tst_OV()) goto JMP; goto decode_op;
-		case 10: JL: if (tst_L()) goto JMP; goto decode_op;
-		case 11: JH: if (tst_H()) goto JMP; goto decode_op;
-		case 12: JOP: if (tst_OP()) goto JMP; goto decode_op;
-		case 13: SBO: cru_w((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1), 1); goto decode_op;
-		case 14: SBZ: cru_w((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1), 0); goto decode_op;
-		case 15: TB: status_equal(cru_r((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1)), 1); goto decode_op;
-		}
-		__builtin_unreachable();
-	case 7-4: { // opcodes 0x0800 .. 0x0fff  shifts
+		mem_w(td.addr, td.val);
+		goto decode_op;
+	SRA: case DECODE(0x0800): case DECODE(0x0880): {
 		u16 val = reg_r(wp, op & 15);
 		u8 count = shift_count(op, wp);
-		// TODO these need cycle counts!
-		cyc += 2 * count;
-		switch ((op >> 8) & 3) {
-		case 0: SRA:
-			if (val & (1 << (count-1))) set_C(); else clr_C();
-			reg_w(wp, op & 15, status_zero(((s16)val) >> count));
-			goto decode_op;
-		case 1: SRL:
-			if (val & (1 << (count-1))) set_C(); else clr_C();
-			reg_w(wp, op & 15, status_zero(val >> count));
-			goto decode_op;
-		case 2: SLA:
-			if (val & (0x8000 >> (count-1))) set_C(); else clr_C();
-			reg_w(wp, op & 15, status_zero(val << count));
-			// overflow if MSB changes during shift
-			if (count == 16) {
-				if (val) set_OV(); else clr_OV();
-			} else {
-				u16 ov_mask = 0xffff << (15 - count);
-				val &= ov_mask;
-				if (val != 0 && val != ov_mask) set_OV(); else clr_OV();
-			}
-			goto decode_op;
-		case 3: SRC:
-			if (val & (1 << (count-1))) set_C(); else clr_C();
-			reg_w(wp, op & 15, status_zero((val << (16-count))|(val >> count)));
-			goto decode_op;
+		if (val & (1 << (count-1))) set_C(); else clr_C();
+		reg_w(wp, op & 15, status_zero(((s16)val) >> count));
+		goto decode_op; }
+	SRL: case DECODE(0x0900): case DECODE(0x0980): {
+		u16 val = reg_r(wp, op & 15);
+		u8 count = shift_count(op, wp);
+		if (val & (1 << (count-1))) set_C(); else clr_C();
+		reg_w(wp, op & 15, status_zero(val >> count));
+		goto decode_op; }
+	SLA: case DECODE(0x0A00): case DECODE(0x0A80): {
+		u16 val = reg_r(wp, op & 15);
+		u8 count = shift_count(op, wp);
+		if (val & (0x8000 >> (count-1))) set_C(); else clr_C();
+		reg_w(wp, op & 15, status_zero(val << count));
+		// overflow if MSB changes during shift
+		if (count == 16) {
+			if (val) set_OV(); else clr_OV();
+		} else {
+			u16 ov_mask = 0xffff << (15 - count);
+			val &= ov_mask;
+			if (val != 0 && val != ov_mask) set_OV(); else clr_OV();
 		}
-		__builtin_unreachable();
-		}
-	case 7-5: { // opcodes 0x0400 .. 0x07ff
-		struct val_addr td;
-		cyc -= 2;
-		switch ((op >> 6) & 15) {
-		case 0: BLWP:
-			cyc += 10;
-			undo_push(UNDO_WP, wp);
-			td = Td(op, &pc, wp);
-			//debug_log("OLD pc=%04X wp=%04X st=%04X  NEW pc=%04X wp=%04X\n", pc, wp, st, safe_r(va.addr+2), va.val);
-			mem_w(td.val + 2*13, wp);
-			mem_w(td.val + 2*14, pc);
-			mem_w(td.val + 2*15, get_st());
-			pc = mem_r(td.addr + 2);
-			wp = td.val;
-			Td_post_increment(op, wp, td, 2);
-			goto decode_op_now; // next instruction cannot be interrupted
-		case 1: B:    td = Td(op, &pc, wp); Td_post_increment(op, wp, td, 2); pc = td.addr; goto decode_op;
-		case 2: X:    td = Td(op, &pc, wp); Td_post_increment(op, wp, td, 2); op = td.val; /*printf("X op=%x pc=%x\n", op, pc);*/ goto execute_op;
-		case 3: CLR:  td = Td(op, &pc, wp); td.val = 0; mem_w_Td(op, wp, td); goto decode_op;
-		case 4: NEG:  td = Td(op, &pc, wp); td.val = sub(0, td.val); mem_w_Td(op, wp, td); goto decode_op;
-		case 5: INV:  td = Td(op, &pc, wp); td.val = status_zero(~td.val); mem_w_Td(op, wp, td); goto decode_op;
-		case 6: INC:  td = Td(op, &pc, wp); td.val = add(td.val,1); mem_w_Td(op, wp, td); goto decode_op;
-		case 7: INCT: td = Td(op, &pc, wp); td.val = add(td.val,2); mem_w_Td(op, wp, td); goto decode_op;
-		case 8: DEC:  td = Td(op, &pc, wp); td.val = sub(td.val,1); mem_w_Td(op, wp, td); goto decode_op;
-		case 9: DECT: td = Td(op, &pc, wp); td.val = sub(td.val,2); mem_w_Td(op, wp, td); goto decode_op;
-		case 10: BL:   td = Td(op, &pc, wp); Td_post_increment(op, wp, td, 2); reg_w(wp, 11, pc); pc = td.addr; goto decode_op;
-		case 11: SWPB: td = Td(op, &pc, wp); td.val = swpb(td.val); mem_w_Td(op, wp, td); goto decode_op;
-		case 12: SETO: td = Td(op, &pc, wp); td.val = 0xffff; mem_w_Td(op, wp, td); goto decode_op;
-		case 13: ABS:
-			td = Td(op, &pc, wp);
-			status_zero(td.val); // status compared to zero before operation
-			clr_OV();
-			clr_C(); // carry is not listed affected in manual, but it is
-			//printf("%04x\n", td.val);
-			if (td.val & 0x8000) { // negative? (sign bit set)
-				cyc += 4;
-				if (td.val == 0x8000)
-					set_OV();
-				else {
-					td.val = -td.val;
-				}
-			} else {
-				cyc += 2;
-			}
-			mem_w_Td(op, wp, td);
-			goto decode_op;
-		case 14: goto UNHANDLED;
-		case 15: goto UNHANDLED;
-		}
-		__builtin_unreachable();
-		}
-	case 7-6: { // opcodes 0x0200 .. 0x03ff
-		u8 reg = op & 15;
+		goto decode_op; }
+	SRC: case DECODE(0x0B00): case DECODE(0x0B80): {
+		u16 val = reg_r(wp, op & 15);
+		u8 count = shift_count(op, wp);
+		if (val & (1 << (count-1))) set_C(); else clr_C();
+		reg_w(wp, op & 15, status_zero((val << (16-count))|(val >> count)));
+		goto decode_op; }
 
-		switch ((op >> 5) & 15) {
-		case 0: LI: reg_w(wp, reg, status_zero(mem_r(pc))); pc += 2; goto decode_op;
-		case 1: AI: reg_w(wp, reg, add(reg_r(wp, reg), mem_r(pc))); pc += 2; goto decode_op;
-		case 2: ANDI: reg_w(wp, reg, status_zero(reg_r(wp, reg) & mem_r(pc))); pc += 2; goto decode_op;
-		case 3: ORI: reg_w(wp, reg, status_zero(reg_r(wp, reg) | mem_r(pc))); pc += 2; goto decode_op;
-		case 4: CI: status_arith(reg_r(wp, reg), mem_r(pc)); cyc += 2; pc += 2; goto decode_op;
-		case 5: STWP: reg_w(wp, reg, wp); goto decode_op;
-		case 6: STST: reg_w(wp, reg, get_st()); goto decode_op;
-		case 7: LWPI: cyc -= 2; undo_push(UNDO_WP, wp); wp = mem_r(pc); cyc += 2; pc += 2; goto decode_op;
-		case 8: LIMI: cyc -= 2; undo_push(UNDO_WP, wp); set_IM(mem_r(pc) & 15); pc += 2; gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
-		case 9: goto UNHANDLED;
-		case 10: IDLE: debug_log("IDLE not implemented\n");/* TODO */ goto decode_op;
-		case 11: RSET: debug_log("RSET not implemented\n"); /* TODO */ goto decode_op;
-		case 12: RTWP: undo_push(UNDO_WP, wp); set_st(reg_r(wp, 15)); pc = reg_r(wp, 14); wp = reg_r(wp, 13); gPC=pc; gWP=wp; check_interrupt_level(); pc=gPC; wp=gWP; goto decode_op;
-		case 13: CKON: debug_log("CKON not implemented\n");/* TODO */ goto decode_op;
-		case 14: CKOF: debug_log("CKOF not implemented\n");/* TODO */ goto decode_op;
-		case 15: LREX: debug_log("LREX not implemented\n");/* TODO */ goto decode_op;
+        JMP: case DECODE(0x1000): cyc += 2; pc += 2 * (s8)(op & 0xff); goto decode_op;
+        JLT: case DECODE(0x1100): if (tst_LT()) goto JMP; goto decode_op;
+        JLE: case DECODE(0x1200): if (tst_LE()) goto JMP; goto decode_op;
+        JEQ: case DECODE(0x1300): if (tst_EQ()) goto JMP; goto decode_op;
+        JHE: case DECODE(0x1400): if (tst_HE()) goto JMP; goto decode_op;
+        JGT: case DECODE(0x1500): if (tst_GT()) goto JMP; goto decode_op;
+        JNE: case DECODE(0x1600): if (!tst_EQ()) goto JMP; goto decode_op;
+        JNC: case DECODE(0x1700): if (!tst_C()) goto JMP; goto decode_op;
+        JOC: case DECODE(0x1800): if (tst_C()) goto JMP; goto decode_op;
+        JNO: case DECODE(0x1900): if (!tst_OV()) goto JMP; goto decode_op;
+        JL:  case DECODE(0x1A00): if (tst_L()) goto JMP; goto decode_op;
+        JH:  case DECODE(0x1B00): if (tst_H()) goto JMP; goto decode_op;
+        JOP: case DECODE(0x1C00): if (tst_OP()) goto JMP; goto decode_op;
+        SBO: case DECODE(0x1D00): cru_w((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1), 1); goto decode_op;
+        SBZ: case DECODE(0x1E00): cru_w((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1), 0); goto decode_op;
+        TB:  case DECODE(0x1F00): status_equal(cru_r((op & 0xff) + ((reg_r(wp, 12) & 0x1ffe) >> 1)), 1); goto decode_op;
+
+	COC: case DECODE(0x2000): case DECODE(0x2200): {
+		u16 ts = Ts(op, &pc, wp, 2);
+		u16 td = reg_r(wp, (op >> 6) & 15);
+		if ((ts & td) == ts) set_EQ(); else clr_EQ();
+		cyc += 2;
+		goto decode_op; }
+	CZC: case DECODE(0x2400): case DECODE(0x2600): {
+		u16 ts = Ts(op, &pc, wp, 2);
+		u16 td = reg_r(wp, (op >> 6) & 15);
+		if (!(ts & td)) set_EQ(); else clr_EQ();
+		cyc += 2;
+		goto decode_op; }
+	XOR: case DECODE(0x2800): case DECODE(0x2A00): {
+		u8 reg = (op >> 6) & 15;
+		u16 ts = Ts(op, &pc, wp, 2);
+		u16 td = reg_r(wp, reg);
+		reg_w(wp, reg, status_zero(ts ^ td));
+		goto decode_op; }
+	XOP: case DECODE(0x2C00): case DECODE(0x2E00): {
+		struct val_addr td = Td(op, &pc, wp, 2); // source
+		u8 reg = (op >> 6) & 15; // XOP number usually 1 or 2
+		u16 ts = mem_r(0x0040 + (reg << 2)); // new WP
+
+		undo_push(UNDO_WP, wp);
+		mem_w(ts + 2*11, td.addr); // gAS copied to R11
+		mem_w(ts + 2*13, wp); // WP to R13
+		mem_w(ts + 2*14, pc); // PC to R14
+		mem_w(ts + 2*15, get_st()); // ST to R15
+		pc = mem_r(0x0042 + (reg << 2));
+		wp = ts;
+		set_X();
+		goto decode_op_now; } // next instruction cannot be interrupted
+
+	LDCR: case DECODE(0x3000): case DECODE(0x3200): {
+		u8 idx, c = ((op >> 6) & 15) ?: 16;
+		u16 ts, reg = (reg_r(wp, 12) & 0x1ffe) >> 1;
+		if (c <= 8) {
+			ts = Ts(op, &pc, wp, 1) >> 8;
+			status_parity(ts);
+		} else {
+			ts = Ts(op, &pc, wp, 2);
 		}
-		__builtin_unreachable();
+		for (idx = 0; idx < c; idx++)
+			cru_w(reg + idx, (ts >> idx) & 1);
+		status_zero(ts);
+		goto decode_op; }
+	STCR: case DECODE(0x3400): case DECODE(0x3600): {
+		u8 idx, c = ((op >> 6) & 15) ?: 16;
+		u16 reg = (reg_r(wp, 12) & 0x1ffe) >> 1;
+		if (c <= 8) {
+			td = Td(op, &pc, wp, 1);
+			td.val &= (td.addr & 1) ? 0xff00 : 0x00ff;
+			u16 base = (td.addr & 1) ? 1 : 0x100;
+			for (idx = 0; idx < c; idx++) {
+				if (cru_r(reg + idx))
+					td.val |= (base << idx);
+			}
+			mem_w(td.addr, td.val);
+			status_parity(status_zero(td.val & 0xff00));
+		} else {
+			td = Td(op, &pc, wp, 2);
+			td.val = 0;
+			for (idx = 0; idx < c; idx++) {
+				if (cru_r(reg + idx))
+					td.val |= (1 << idx);
+			}
+			mem_w(td.addr, td.val);
+			status_zero(td.val);
 		}
+		// TODO status bits
+		goto decode_op; }
+	MPY: case DECODE(0x3800): case DECODE(0x3A00): {
+		u32 val = Ts(op, &pc, wp, 2);
+		u8 reg = (op >> 6) & 15;
+		//debug_log("MPY %04X x %04X = %08X\n", 
+		//	val, reg_r(wp, reg), val * reg_r(wp, reg));
+		val *= reg_r(wp, reg);
+		reg_w(wp, reg, val >> 16);
+		reg_w(wp, reg+1, val & 0xffff);
+		goto decode_op; }
+	DIV: case DECODE(0x3C00): case DECODE(0x3E00): {
+		u32 val;
+		u16 ts = Ts(op, &pc, wp, 2);
+		u8 reg = (op >> 6) & 15;
+		val = reg_r(wp, reg);
+		if (ts <= val) {
+			set_OV();
+		} else {
+			clr_OV();
+			val = (val << 16) | reg_r(wp, reg+1);
+			//debug_log("DIV %08X by %04X\n", val, ts);
+			reg_w(wp, reg, val / ts);
+			reg_w(wp, reg+1, val % ts);
+		}
+		goto decode_op; }
+
+	SZC: case DECODE(0x4000): case DECODE(0x4400): case DECODE(0x4800): case DECODE(0x4C00):
+		word_op(&op, &pc, wp, &ts, &td);
+		td.val = status_zero(td.val & ~ts); mem_w(td.addr, td.val); goto decode_op;
+	SZCB: case DECODE(0x5000): case DECODE(0x5400): case DECODE(0x5800): case DECODE(0x5C00):
+		byte_op(&op, &pc, wp, &ts, &td);
+		if (td.addr & 1) {
+			td.val &= ~(ts >> 8);
+			status_parity(status_zero(td.val << 8));
+		} else {
+			td.val &= ~ts;
+			status_parity(status_zero(td.val & 0xff00));
+		}
+		mem_w(td.addr, td.val);
+		goto decode_op;
+	S: case DECODE(0x6000): case DECODE(0x6400): case DECODE(0x6800): case DECODE(0x6C00):
+		word_op(&op, &pc, wp, &ts, &td);
+		td.val = sub(td.val, ts); mem_w(td.addr, td.val); goto decode_op;
+	SB: case DECODE(0x7000): case DECODE(0x7400): case DECODE(0x7800): case DECODE(0x7C00):
+		byte_op(&op, &pc, wp, &ts, &td);
+		if (td.addr & 1) {
+			td.val = (td.val & 0xff00) | status_parity(sub(td.val << 8, ts) >> 8);
+		} else {
+			td.val = (td.val & 0x00ff) | status_parity(sub(td.val & 0xff00, ts));
+		}
+		mem_w(td.addr, td.val);
+		goto decode_op;
+	C: case DECODE(0x8000): case DECODE(0x8800):
+		word_op(&op, &pc, wp, &ts, &td);
+		status_arith(ts, td.val); cyc+=2; goto decode_op;
+	CB: case DECODE(0x9000): case DECODE(0x9800):
+		byte_op(&op, &pc, wp, &ts, &td);
+		if (td.addr & 1) {
+			status_arith(status_parity(ts), td.val << 8);
+		} else {
+			status_arith(status_parity(ts), td.val & 0xff00);
+		}
+		cyc += 2;
+		goto decode_op;
+	A: case DECODE(0xA000): case DECODE(0xA800):
+		word_op(&op, &pc, wp, &ts, &td);
+		td.val = add(td.val, ts); mem_w(td.addr, td.val); goto decode_op;
+	AB: case DECODE(0xB000): case DECODE(0xB800):
+		byte_op(&op, &pc, wp, &ts, &td);
+		if (td.addr & 1) {
+			td.val = (td.val & 0xff00) | status_parity(add(td.val << 8, ts) >> 8);
+		} else {
+			td.val = (td.val & 0x00ff) | status_parity(add(td.val & 0xff00, ts));
+		}
+		mem_w(td.addr, td.val);
+		goto decode_op;
+	MOV: case DECODE(0xC000): case DECODE(0xC800):
+		word_op(&op, &pc, wp, &ts, &td);
+		td.val = status_zero(ts); mem_w(td.addr, td.val); goto decode_op;
+	MOVB: case DECODE(0xD000): case DECODE(0xD800):
+		byte_op(&op, &pc, wp, &ts, &td);
+		if (td.addr & 1) {
+			td.val = (td.val & 0xff00) | status_parity(status_zero(ts) >> 8);
+		} else {
+			td.val = (td.val & 0x00ff) | status_parity(status_zero(ts));
+		}
+		mem_w(td.addr, td.val);
+		goto decode_op;
+	SOC: case DECODE(0xE000): case DECODE(0xE800):
+		word_op(&op, &pc, wp, &ts, &td);
+		td.val = status_zero(td.val | ts); mem_w(td.addr, td.val); goto decode_op;
+	SOCB: case DECODE(0xF000): case DECODE(0xF800):
+		byte_op(&op, &pc, wp, &ts, &td);
+		if (td.addr & 1) {
+			td.val |= (ts >> 8);
+			status_parity(status_zero(td.val << 8));
+		} else {
+			td.val |= ts;
+			status_parity(status_zero(td.val & 0xff00));
+		}
+		mem_w(td.addr, td.val);
+		goto decode_op;
+
 	default:
-		printf("%04x: %04x  %d\n", pc, op, (int)__builtin_clz(op));
+		{
+			static int last_pc = -1;
+			if (last_pc != pc-2)
+				printf("illegal opcode at %04x: %04x  clz=%d\n", pc, op, op ? (int)__builtin_clz(op) : 0);
+			last_pc = pc;
+		}
 		UNHANDLED:
 		if (op == C99_BRK) {
 #ifdef ENABLE_DEBUGGER
@@ -1414,7 +1318,7 @@ void generate_test_code(u16 *dest)
 			const char *isn = isns[i];
 			for (j = 0; j < ARRAY_SIZE(srcs); j++) {
 				fprintf(f, "       %s %s %s%s\n", isn,
-					srcs[j], 
+					srcs[j],
 					sspd[j][0] ? " ;: " : "",
 					sspd[j]);
 			}
