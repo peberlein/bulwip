@@ -209,7 +209,7 @@ static void update(unsigned char *buffer, int offset, int samplesToGenerate, uns
 			static double last = 0.0;
 
 			last = .8*last + .2*v; // exponential low-pass filter
-			buffer[offset++] = last*0.40+128;
+			buffer[offset++] = last*0.25+128;
 			samplesToGenerate--;
 
 			v = 0.0;
