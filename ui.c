@@ -686,7 +686,7 @@ void append_str(char** restrict dst, const char* restrict src)
 }
 
 
-static void dir_scroll(char* restrict dir,
+static void dir_scroll(const char* restrict dir,
                 unsigned int* restrict offset,
                 unsigned int* restrict sel,
                 int delta)
@@ -770,7 +770,7 @@ static int load_cart_menu(void)
 	static int dir_saved = 0, file_saved = 0;
 	unsigned int dir_sel = 0, file_sel = 0;
 	unsigned int dir_off = 0, file_off = 0;
-	char *dirs = NULL, *files = NULL;
+	char *dirs = NULL, *files = NULL, *cur_dir = NULL, *last_dir = NULL;
 	int ret = 0;
 	int x = 6*6, y = 5*8, w = MENU_DIR_W, h = MENU_DIR_H;
 
@@ -843,6 +843,28 @@ rescan:
 
 	file_sel = 0;
 	dir_sel = 0;
+
+	// If the directory was changed by [..], select previous
+	//printf("last_dir=%s cur_dir=%s\n", last_dir, cur_dir);
+	if (last_dir) {
+		unsigned int i = 0;
+		unsigned int l = strlen(last_dir);
+		unsigned int dir_len = strlen(dirs);
+		unsigned int n = 0;
+		while (i < dir_len && dirs[i]) {
+			if (i+2+l < dir_len && dirs[i+2+l] == '\n' &&
+				strncmp(dirs+i+1, last_dir, l) == 0)
+			{
+				dir_scroll(dirs, &dir_off, &dir_sel, n);
+				break;
+			}
+			i = next_line(dirs, dir_len, i);
+			n++;
+		}
+		free(last_dir);
+		last_dir = NULL;
+	}
+	// Restore the previous dir and file offsets if saved
 	if (dir_saved) {
 		dir_scroll(dirs, &dir_off, &dir_sel, dir_saved);
 		dir_saved = 0;
@@ -851,6 +873,7 @@ rescan:
 		dir_scroll(files, &file_off, &file_sel, file_saved);
 		file_saved = 0;
 	}
+
 	//printf("files=%d off=%d sel=%d\n", strlen(files), file_off, file_sel);
 
 	while (1) {
@@ -887,6 +910,20 @@ rescan:
 			case TI_FIRE1: case TI_ENTER: case TI_SPACE:
 				{	char *entry = copy_line(dirs, dir_off, dir_sel);
 					if (!entry) break;
+					if (strcmp(entry, "[..]") == 0) {
+						// changing to parent
+						char buf[FILENAME_MAX];
+#ifdef _WIN32
+						if (_getcwd(buf, sizeof(buf))) {
+							last_dir = _strdup(strrchr(buf, '\\')+1);
+						}
+#else
+						if (getcwd(buf, sizeof(buf))) {
+							last_dir = strdup(strrchr(buf, '/')+1);
+						}
+#endif
+						//printf("last_dir=%s\n", last_dir);
+					}
 					// remove side [ ] chars
 					int len = strlen(entry);
 					memmove(entry, entry+1, len-2);
@@ -910,6 +947,8 @@ done:
 	dir_saved = count_lines(dirs, strlen(dirs), dir_off) + dir_sel;
 	file_saved = count_lines(files, strlen(files), file_off) + file_sel;
 
+	free(last_dir);
+	free(cur_dir);
 	free(dirs);
 	free(files);
 	vdp_text_clear(x,y, w*2+2,h+1, CLEAR);
