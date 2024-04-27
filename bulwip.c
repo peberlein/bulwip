@@ -35,10 +35,6 @@
 #include <stdbool.h>
 
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
-
 #include "cpu.h"
 
 
@@ -1102,11 +1098,12 @@ u8 cru_r(u16 bit)
 	case 0: return timer_mode;
 	case 2: //debug_log("VDPST=%02X\n", vdp.reg[VDP_ST]);
 		return !(vdp.reg[VDP_ST] & 0x80);
+		// row 0 1 2 3 4 5 6     7
 	case 3: //     = . , M N / fire1 fire2
-	case 4: // space L K J H ;
-	case 5: // enter O I U Y P
-	case 6: //       9 8 7 6 0
-	case 7: //  fctn 2 3 4 5 1
+	case 4: // space L K J H ; left  left
+	case 5: // enter O I U Y P right right
+	case 6: //       9 8 7 6 0 down  down
+	case 7: //  fctn 2 3 4 5 1 up    up
 	case 8: // shift S D F G A
 	case 9: //  ctrl W E R T Q
 	case 10://       X C V B Z
@@ -1114,6 +1111,15 @@ u8 cru_r(u16 bit)
 			// CRU 21 is set ALPHA-LOCK
 			return bit == 7 ? 1^alpha_lock : 1;
 		}
+		if ((keyboard_row & 7) >= 6) {
+			// See: https://forums.atariage.com/topic/365610-keyboardjoystick-conflict/
+			// Joysticks are disabled by keys on the same lines
+			u8 rows = keyboard[0] | keyboard[1] | keyboard[2] |
+				  keyboard[3] | keyboard[4] | keyboard[5];
+			if ((rows >> (bit-3)) & 1)
+				return 1; // not pressed
+		}
+
 		return ((keyboard[keyboard_row] >> (bit-3)) & 1)^1; // active low
 
 	default: fprintf(stderr, "TB %d not implemented\n", bit); break;

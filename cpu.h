@@ -22,6 +22,9 @@ typedef signed char s8;
 #ifndef BIT
 #define BIT(x)  (1UL<<(x))
 #endif
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 
 #ifdef TEST
